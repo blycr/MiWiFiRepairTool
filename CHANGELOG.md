@@ -3,7 +3,7 @@
 ## v0.1.0（第一版，2025-08-16）—— 当前代码基线
 
 本项目为纯命令行重写（Rust），行为对齐旧版工具与 tftpd32 定制逻辑；
-按 **EUPL 1.1** 发布（与上游 tftpd32 许可一致）。衍生关系与第三方声明见 [NOTICE.md](../NOTICE.md)。
+按 **EUPL 1.1** 发布（与上游 tftpd32 许可一致）。衍生关系与第三方声明见 [NOTICE.md](NOTICE.md)。
 
 ### 功能
 
@@ -30,6 +30,18 @@
 - 单实例互斥守卫、下载失败清理半成品、会话代次 epoch 防旧回调污染、
   提权子进程 `catch_unwind` + 自回滚、网卡枚举跳过 Loopback、ICMP 探测超时 1s→300ms、
   VT 序列显式启用（conhost 自动降级滚动输出）、tty 面板日志去重、ASCII 提示。
+
+### 工程化（发布前规范化）
+
+- **代码架构**：`cli.rs`（1458 行）拆分为 `menu / session / status / help / cli / util`
+  模块（各 <500 行，职责单一）；全部模块补 SPDX 头与模块文档。
+- **工具链固定**：`rust-toolchain.toml`（stable + rustfmt/clippy + 双 target）、
+  `rustfmt.toml`；Cargo workspace 补 description/repository/readme/keywords/categories。
+- **单元测试**：8 个（token 拆分 / ROM URL 清洗与列表解析 / 租约持久化往返）。
+- **CI**（GitHub Actions）：fmt / clippy（-D warnings）/ 单测 / 双架构 release 构建，
+  每次 push 与 PR 自动执行。
+- **文档体系**：README 中英双版、CONTRIBUTING、SECURITY、docs/architecture.md、
+  docs/cli-design.md；历史审计段落移入本 CHANGELOG。
 
 ### 分发与合规（本版）
 

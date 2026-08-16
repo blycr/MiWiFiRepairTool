@@ -1,7 +1,7 @@
 # MiWiFiRepairTool（Rust 重构版）
 
-小米路由器刷机修复工具 —— Rust 重构版，**纯命令行交互**。行为对齐 `old/` 原版（tftpd32 定制 + 小米云端 ROM 下载 + 中文刷机向导）与 C# 重写版（`src/`），代码注释使用中文。
-界面设计（菜单 / 状态视图 / 进度条）见 `docs/CLI_DESIGN.md`。
+小米路由器刷机修复工具 —— Rust 重构版，**纯命令行交互**。行为对齐 `old/` 原版（tftpd32 定制 + 小米云端 ROM 下载 + 中文刷机向导）与 C# 重写版（已归档 `../archive/csharp/`），代码注释使用中文。
+界面设计（菜单 / 状态视图 / 进度条）见 `../docs/cli-design.md`。
 
 ## 架构
 
@@ -107,7 +107,7 @@ DHCP、TFTP、netsh 网卡与防火墙配置、UAC 提权等操作。被拦截�
 
 ## 界面（命令行）
 
-设计文档（字符版）见 `docs/CLI_DESIGN.md`：
+设计文档（字符版）见 `../docs/cli-design.md`：
 
 - 主菜单：编号选择网卡 / 刷机包 / 云端下载（`[####------] 53% 1.2 MB/s` 单行进度条）
 - 刷机状态视图：终端每秒清屏重绘（状态面板 + 最近日志环形区），三色连接状态指示；
@@ -129,7 +129,7 @@ DHCP、TFTP、netsh 网卡与防火墙配置、UAC 提权等操作。被拦截�
 - 防冲突探测、ARP 缓存清理补齐原版（tftpd32 定制版）行为；C# 版缺少这两项
 - 租约持久化改为 JSON 文件（原版用注册表 `SOFTWARE\RRT\DHCP`，更易迁移/备份）
 - 云端请求 UA 为 `Mozilla/5.0 MiWiFiRepairTool/2.0`，修复原版 double-scheme 解析 bug
-- 详细差异对照见 `docs/RUST_REWRITE_REVIEW.md`
+  （与旧版/C# 版的差异对照属内部材料，仅本地保留）
 
 ## 许可
 
