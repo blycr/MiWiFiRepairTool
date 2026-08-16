@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! 回环自检（行为对齐 C# 版 SelfTest）：退出码 0 = 全部通过。
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -287,20 +288,25 @@ fn download_file(
     cli.send_to(&rrq, srv).map_err(|e| e.to_string())?;
 
     let mut buf = [0u8; 2048];
-    let (n, from) = cli.recv_from(&mut buf).map_err(|_| "timeout waiting OACK".to_string())?;
+    let (n, from) = cli
+        .recv_from(&mut buf)
+        .map_err(|_| "timeout waiting OACK".to_string())?;
     let _ = n;
     let op = ((buf[0] as u16) << 8) | buf[1] as u16;
     if op != 6 {
         return Err("expected OACK".into());
     }
-    cli.send_to(&[0u8, 4, 0, 0], from).map_err(|e| e.to_string())?;
+    cli.send_to(&[0u8, 4, 0, 0], from)
+        .map_err(|e| e.to_string())?;
 
     let mut received: Vec<u8> = Vec::with_capacity(expected.len());
     let mut block: u16 = 1;
     let mut packets = 0usize;
     let mut last = false;
     while !last {
-        let (n, from) = cli.recv_from(&mut buf).map_err(|_| "timeout waiting DATA".to_string())?;
+        let (n, from) = cli
+            .recv_from(&mut buf)
+            .map_err(|_| "timeout waiting DATA".to_string())?;
         let op = ((buf[0] as u16) << 8) | buf[1] as u16;
         if op == 5 {
             return Err("server ERROR".into());
@@ -364,7 +370,9 @@ fn test_tftp_wrq() -> bool {
             }
             let code = ((buf[2] as u16) << 8) | buf[3] as u16;
             if code != 2 {
-                return Err(format!("expected error code 2 (Access violation), got {code}"));
+                return Err(format!(
+                    "expected error code 2 (Access violation), got {code}"
+                ));
             }
             // 拒绝上传时不得创建目标文件
             if root.join("upload.bin").exists() {
@@ -446,7 +454,10 @@ fn test_rom_parse() -> bool {
         println!("FAIL (count {})", list.len());
         return false;
     }
-    if !list[1].url.to_ascii_lowercase().starts_with("http://bigota.miwifi.com")
+    if !list[1]
+        .url
+        .to_ascii_lowercase()
+        .starts_with("http://bigota.miwifi.com")
         || list[1].url.to_ascii_lowercase().contains("http://http://")
     {
         println!("FAIL (double scheme not sanitized)");
@@ -456,7 +467,11 @@ fn test_rom_parse() -> bool {
         println!("FAIL (size)");
         return false;
     }
-    if !list[0].url.to_ascii_lowercase().ends_with("miwifi_r4_firmware_f1bbb_2.26.145.bin") {
+    if !list[0]
+        .url
+        .to_ascii_lowercase()
+        .ends_with("miwifi_r4_firmware_f1bbb_2.26.145.bin")
+    {
         println!("FAIL (filename)");
         return false;
     }
@@ -496,15 +511,15 @@ fn cleanup_root(root: &PathBuf) {
 
 fn rand_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     (t ^ std::process::id() as u128) as u64
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {
-    ((b[o] as u32) << 24)
-        | ((b[o + 1] as u32) << 16)
-        | ((b[o + 2] as u32) << 8)
-        | b[o + 3] as u32
+    ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | b[o + 3] as u32
 }
 
 fn put_be32(b: &mut [u8], o: usize, v: u32) {

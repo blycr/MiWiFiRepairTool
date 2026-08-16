@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! ARP 探测 / ARP 缓存清理 / ICMP echo。
 //!
 //! 对应原版行为：
@@ -16,8 +17,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_FOUND, GetLastError, HANDLE, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    DeleteIpNetEntry, GetIpNetTable, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, SendARP,
-    MIB_IPNETROW_LH, MIB_IPNETTABLE,
+    DeleteIpNetEntry, GetIpNetTable, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    MIB_IPNETROW_LH, MIB_IPNETTABLE, SendARP,
 };
 
 /// ICMP 超时错误码（IP_REQ_TIMED_OUT = 11010；windows-sys 未导出该常量，用字面量）

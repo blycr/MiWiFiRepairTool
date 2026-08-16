@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! 与 C# 版 / 原版一致的默认配置常量。
 
 /// 刷机时网卡静态地址（网关也指向它，DHCP option 3/54）

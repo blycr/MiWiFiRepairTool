@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! 小米云端 ROM 列表与下载（行为对齐 C# 版 RomService）。
 
 use std::fs::File;
@@ -152,5 +153,48 @@ fn fmt_ureq_err(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, _) => format!("HTTP {code}"),
         ureq::Error::Transport(t) => t.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_double_scheme() {
+        // 多层 scheme 前缀压到一层（保留真实 scheme）
+        assert_eq!(sanitize_url("http://http://x/y.bin"), "http://x/y.bin");
+        assert_eq!(sanitize_url("https://http://a/b"), "http://a/b");
+        assert_eq!(
+            sanitize_url("http://http://http://x/y.bin"),
+            "http://x/y.bin"
+        );
+        // 正常 URL 不变
+        assert_eq!(sanitize_url("http://a/b"), "http://a/b");
+    }
+
+    #[test]
+    fn parse_list() {
+        let body = "小米路由器 4|http://http://x/r4.bin|15728640| 4Q |http://y/r4c.bin|9962408";
+        let v = parse(body);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "小米路由器 4");
+        assert_eq!(v[0].url, "http://x/r4.bin");
+        assert_eq!(v[0].size, 15728640);
+        assert_eq!(v[1].name, "4Q");
+        assert_eq!(v[1].size, 9962408);
+    }
+
+    #[test]
+    fn url_basename_basic() {
+        assert_eq!(
+            url_basename("http://h/dir/fw.bin").as_deref(),
+            Some("fw.bin")
+        );
+        assert_eq!(
+            url_basename("http://h/fw.bin?x=1").as_deref(),
+            Some("fw.bin")
+        );
+        assert_eq!(url_basename("http://h/"), None);
     }
 }

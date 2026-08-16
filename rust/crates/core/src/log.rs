@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! 线程安全日志器。行格式与原版 tftp.log 一致：`[dd/MM HH:mm:ss.fff] message`。
 //!
 //! 级别：Debug < Info < Warn < Error。

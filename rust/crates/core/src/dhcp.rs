@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! RFC 2131 DHCP 服务器（行为对齐 C# 版 DhcpServer）。
 //!
 //! 特性：
@@ -142,9 +143,19 @@ impl DhcpServer {
                             if n >= 240 && running.load(Ordering::SeqCst) {
                                 let copy = buffer[..n].to_vec();
                                 handle_packet(
-                                    copy, src, server_ip, pool_start, pool_size, lease_seconds,
-                                    &leases, &bad_ips, &log, &last_activity,
-                                    lease_changed.as_ref(), probe.as_ref(), &socket,
+                                    copy,
+                                    src,
+                                    server_ip,
+                                    pool_start,
+                                    pool_size,
+                                    lease_seconds,
+                                    &leases,
+                                    &bad_ips,
+                                    &log,
+                                    &last_activity,
+                                    lease_changed.as_ref(),
+                                    probe.as_ref(),
+                                    &socket,
                                 );
                             }
                         }
@@ -230,7 +241,7 @@ fn handle_packet(
         return; // 只处理 Ethernet BOOTREQUEST
     }
     let hlen = pkt[2];
-    if hlen < 6 || hlen > 16 {
+    if !(6..=16).contains(&hlen) {
         return; // 硬件地址长度非法（>16 会越界 panic）
     }
     // 报文校验通过才刷新活动时间（防空转保护被无关流量抑制）
@@ -261,21 +272,47 @@ fn handle_packet(
                 ),
             );
             handle_discover(
-                xid, flags, &mac, &chaddr, giaddr, src, server_ip, pool_start, pool_size,
-                lease_seconds, leases, bad_ips, log, lease_changed, probe, socket,
+                xid,
+                flags,
+                &mac,
+                &chaddr,
+                giaddr,
+                src,
+                server_ip,
+                pool_start,
+                pool_size,
+                lease_seconds,
+                leases,
+                bad_ips,
+                log,
+                lease_changed,
+                probe,
+                socket,
             );
         }
         MSG_REQUEST => {
             log(
                 LogLevel::Debug,
-                &format!(
-                    "Rcvd DHCP Rqst Msg for IP {}, Mac {mac}",
-                    ip_string(ciaddr)
-                ),
+                &format!("Rcvd DHCP Rqst Msg for IP {}, Mac {mac}", ip_string(ciaddr)),
             );
             handle_request(
-                xid, flags, &mac, &chaddr, giaddr, ciaddr, &options, src, server_ip, pool_start,
-                pool_size, lease_seconds, leases, bad_ips, log, lease_changed, socket,
+                xid,
+                flags,
+                &mac,
+                &chaddr,
+                giaddr,
+                ciaddr,
+                &options,
+                src,
+                server_ip,
+                pool_start,
+                pool_size,
+                lease_seconds,
+                leases,
+                bad_ips,
+                log,
+                lease_changed,
+                socket,
             );
         }
         MSG_RELEASE => {
@@ -303,8 +340,17 @@ fn handle_packet(
         MSG_INFORM => {
             log(LogLevel::Debug, "DHCP inform");
             send_reply(
-                socket, xid, flags, &chaddr, giaddr, Ipv4Addr::UNSPECIFIED, MSG_OFFER, true, src,
-                server_ip, lease_seconds,
+                socket,
+                xid,
+                flags,
+                &chaddr,
+                giaddr,
+                Ipv4Addr::UNSPECIFIED,
+                MSG_OFFER,
+                true,
+                src,
+                server_ip,
+                lease_seconds,
             );
         }
         _ => {}
@@ -366,11 +412,22 @@ fn handle_discover(
     drop(bad);
     drop(table);
     send_reply(
-        socket, xid, flags, chaddr, giaddr, ip, MSG_OFFER, false, src, server_ip, lease_seconds,
+        socket,
+        xid,
+        flags,
+        chaddr,
+        giaddr,
+        ip,
+        MSG_OFFER,
+        false,
+        src,
+        server_ip,
+        lease_seconds,
     );
 }
 
 /// 分配池内第一个空闲地址（并写入临时租约，60s 内等 REQUEST 确认）。
+#[allow(clippy::too_many_arguments)]
 fn allocate_free(
     mac: &str,
     pool_start: Ipv4Addr,
@@ -401,11 +458,11 @@ fn allocate_free(
             continue;
         }
         // 防冲突探测：被占用则跳过
-        if let Some(p) = probe {
-            if p(ip) {
-                log(LogLevel::Debug, &format!("Suppress used address {ip}"));
-                continue;
-            }
+        if let Some(p) = probe
+            && p(ip)
+        {
+            log(LogLevel::Debug, &format!("Suppress used address {ip}"));
+            continue;
         }
         let entry = leases.entry(mac.to_string()).or_insert_with(|| Lease {
             ip,
@@ -460,21 +517,42 @@ fn handle_request(
             let l = table.get_mut(mac).unwrap();
             l.acked = true;
             l.expires_unix = now_unix() + lease_seconds as u64;
-            log(LogLevel::Debug, &format!("Previously allocated address {ip} acked"));
+            log(
+                LogLevel::Debug,
+                &format!("Previously allocated address {ip} acked"),
+            );
             if let Some(cb) = lease_changed {
                 cb(mac, ip);
             }
             drop(bad);
             drop(table);
             send_reply(
-                socket, xid, flags, chaddr, giaddr, ip, MSG_ACK, false, src, server_ip,
+                socket,
+                xid,
+                flags,
+                chaddr,
+                giaddr,
+                ip,
+                MSG_ACK,
+                false,
+                src,
+                server_ip,
                 lease_seconds,
             );
         } else {
             log(LogLevel::Warn, "DHCP Nak");
             drop(bad);
             drop(table);
-            send_nak(socket, xid, flags, chaddr, giaddr, src, server_ip, lease_seconds);
+            send_nak(
+                socket,
+                xid,
+                flags,
+                chaddr,
+                giaddr,
+                src,
+                server_ip,
+                lease_seconds,
+            );
         }
         return;
     }
@@ -500,14 +578,26 @@ fn handle_request(
             lease.ip = req;
             lease.acked = true;
             lease.expires_unix = now_unix() + lease_seconds as u64;
-            log(LogLevel::Debug, &format!("Previously allocated address {req} acked"));
+            log(
+                LogLevel::Debug,
+                &format!("Previously allocated address {req} acked"),
+            );
             if let Some(cb) = lease_changed {
                 cb(mac, req);
             }
             drop(bad);
             drop(table);
             send_reply(
-                socket, xid, flags, chaddr, giaddr, req, MSG_ACK, false, src, server_ip,
+                socket,
+                xid,
+                flags,
+                chaddr,
+                giaddr,
+                req,
+                MSG_ACK,
+                false,
+                src,
+                server_ip,
                 lease_seconds,
             );
             return;
@@ -529,7 +619,16 @@ fn handle_request(
         drop(bad);
         drop(table);
         send_reply(
-            socket, xid, flags, chaddr, giaddr, existing.ip, MSG_ACK, false, src, server_ip,
+            socket,
+            xid,
+            flags,
+            chaddr,
+            giaddr,
+            existing.ip,
+            MSG_ACK,
+            false,
+            src,
+            server_ip,
             lease_seconds,
         );
         return;
@@ -538,11 +637,21 @@ fn handle_request(
     log(LogLevel::Warn, "DHCP Nak");
     drop(bad);
     drop(table);
-    send_nak(socket, xid, flags, chaddr, giaddr, src, server_ip, lease_seconds);
+    send_nak(
+        socket,
+        xid,
+        flags,
+        chaddr,
+        giaddr,
+        src,
+        server_ip,
+        lease_seconds,
+    );
 }
 
 // --------------------------------------------------------------------------- 报文构造
 
+#[allow(clippy::too_many_arguments)]
 fn send_nak(
     socket: &Mutex<Option<UdpSocket>>,
     xid: u32,
@@ -554,7 +663,16 @@ fn send_nak(
     lease_seconds: u32,
 ) {
     send_reply(
-        socket, xid, flags, chaddr, giaddr, Ipv4Addr::UNSPECIFIED, MSG_NAK, false, src, server_ip,
+        socket,
+        xid,
+        flags,
+        chaddr,
+        giaddr,
+        Ipv4Addr::UNSPECIFIED,
+        MSG_NAK,
+        false,
+        src,
+        server_ip,
         lease_seconds,
     );
 }
@@ -706,10 +824,7 @@ fn be16(b: &[u8], o: usize) -> u16 {
 }
 
 fn be32(b: &[u8], o: usize) -> u32 {
-    ((b[o] as u32) << 24)
-        | ((b[o + 1] as u32) << 16)
-        | ((b[o + 2] as u32) << 8)
-        | b[o + 3] as u32
+    ((b[o] as u32) << 24) | ((b[o + 1] as u32) << 16) | ((b[o + 2] as u32) << 8) | b[o + 3] as u32
 }
 
 fn put_be16(b: &mut [u8], o: usize, v: u16) {

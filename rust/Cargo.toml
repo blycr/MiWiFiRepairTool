@@ -6,6 +6,11 @@ members = ["crates/core", "crates/selftest", "crates/app"]
 version = "0.1.0"
 edition = "2024"
 license = "EUPL-1.1"
+description = "Xiaomi MiWiFi router repair tool (DHCP + TFTP + cloud ROM) - pure CLI Rust rewrite"
+repository = "https://github.com/blycr/MiWiFiRepairTool"
+readme = "README.md"
+keywords = ["xiaomi", "miwifi", "tftp", "dhcp", "router"]
+categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 windows-sys = { version = "0.59", features = [

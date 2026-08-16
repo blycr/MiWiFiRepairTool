@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
 
 /// Ctrl+C 请求标志（SetConsoleCtrlHandler 回调置位，主循环轮询处理）。
 pub static CTRL_C: AtomicBool = AtomicBool::new(false);
@@ -29,7 +29,7 @@ pub fn run_elevated(op: &str, args: &[String]) -> Result<(), String> {
         GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NO_CONSOLE,
+        SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -114,12 +114,12 @@ pub fn os_version() -> String {
         .output();
     if let Ok(o) = out {
         let text = String::from_utf8_lossy(&o.stdout);
-        if let Some(line) = text.lines().find(|l| l.contains("REG_SZ")) {
-            if let Some(idx) = line.find("REG_SZ") {
-                let v = line[idx + 6..].trim();
-                if !v.is_empty() {
-                    return format!("Windows {v}");
-                }
+        if let Some(line) = text.lines().find(|l| l.contains("REG_SZ"))
+            && let Some(idx) = line.find("REG_SZ")
+        {
+            let v = line[idx + 6..].trim();
+            if !v.is_empty() {
+                return format!("Windows {v}");
             }
         }
     }
@@ -191,7 +191,7 @@ pub fn wait_timeout_output(
 /// 返回是否成功：成功 → 可安全使用 ANSI 清屏/颜色；失败 → 调用方应降级为非 ANSI 输出。
 pub fn enable_vt() -> bool {
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, SetConsoleMode,
     };
     let handle = unsafe {
         windows_sys::Win32::System::Console::GetStdHandle(
@@ -242,4 +242,34 @@ pub fn install_ctrl_c_handler() {
     unsafe {
         windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(handler), 1);
     }
+}
+
+/// ANSI 颜色前缀（调用方需自行追加重置）。
+pub(crate) fn ansi(code: &str) -> String {
+    format!("\x1b[{code}m")
+}
+
+/// ASCII 块进度条：`[####------]`。
+pub(crate) fn progress_bar(frac: f32, width: usize) -> String {
+    let w = width.max(2);
+    let filled = ((frac.clamp(0.0, 1.0)) * w as f32).round() as usize;
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(w - filled))
+}
+
+/// 当前 Unix 时间戳（秒）。
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// DHCP 地址池结束地址（POOL_START + POOL_SIZE - 1）。
+pub(crate) fn pool_end() -> String {
+    let start: u32 = miwifi_repair_core::config::POOL_START
+        .parse::<std::net::Ipv4Addr>()
+        .unwrap()
+        .into();
+    std::net::Ipv4Addr::from(start.wrapping_add(miwifi_repair_core::config::POOL_SIZE - 1))
+        .to_string()
 }

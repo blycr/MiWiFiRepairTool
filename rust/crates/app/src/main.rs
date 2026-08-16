@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.1
 //! 小米路由器修复工具（Rust 重构版）—— 纯命令行版入口。
 //!
-//! - 默认进入交互式命令行菜单（cli.rs）
+//! - 默认进入交互式命令行菜单（cli::run）
 //! - `--selftest`：无头自检，退出码 0 = 全部通过
 //! - `--elevated-op <set|restore> ...`：提权子进程模式（由主进程经 runas 自动调用，
 //!   仅做瞬时管理员操作：netsh 设/恢复网卡 + 防火墙规则；结果写 result 文件后退出；
@@ -15,6 +15,10 @@
 //! 衍生关系与第三方声明见仓库根目录 NOTICE.md。
 
 mod cli;
+mod help;
+mod menu;
+mod session;
+mod status;
 mod util;
 
 fn main() {

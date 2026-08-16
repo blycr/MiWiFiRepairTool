@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! TFTP 服务器（RFC 1350 + 2347/2348/2349），行为对齐 C# 版 TftpServer。
 //!
 //! - RRQ（下载）/WRQ（上传，**一律拒绝**：刷机只需只读下发，防止覆盖程序目录文件），
@@ -10,7 +11,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -140,7 +141,10 @@ impl TftpServer {
                                             &running,
                                         );
                                         if let Err(e) = result {
-                                            log(LogLevel::Error, &format!("TFTP transfer error: {e}"));
+                                            log(
+                                                LogLevel::Error,
+                                                &format!("TFTP transfer error: {e}"),
+                                            );
                                         }
                                     });
                             }
@@ -172,7 +176,7 @@ impl TftpServer {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_transfer(
-    root: &PathBuf,
+    root: &Path,
     bind: Ipv4Addr,
     default_timeout: u32,
     max_retries: u32,
@@ -221,9 +225,7 @@ fn handle_transfer(
         send_error(&tmp, client, 1, "File not found");
         log(
             LogLevel::Warn,
-            &format!(
-                "Read request for file <{file_name}>. Mode {mode} -> not found"
-            ),
+            &format!("Read request for file <{file_name}>. Mode {mode} -> not found"),
         );
         return Ok(());
     }
@@ -236,7 +238,9 @@ fn handle_transfer(
     sessions.lock().unwrap().push(session.clone());
 
     let total_bytes = if op == 1 {
-        std::fs::metadata(&path).map(|m| m.len() as i64).unwrap_or(-1)
+        std::fs::metadata(&path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1)
     } else {
         -1
     };
@@ -313,9 +317,30 @@ fn handle_transfer(
         };
 
         if op == 1 {
-            rrq(&session, client, &path, blksize, &mut info, oack_pkt.as_deref(), max_retries, log, transfer_updated)
+            rrq(
+                &session,
+                client,
+                &path,
+                blksize,
+                &mut info,
+                oack_pkt.as_deref(),
+                max_retries,
+                log,
+                transfer_updated,
+            )
         } else {
-            wrq(&session, client, &path, blksize, &mut info, want_oack, max_retries, log, transfer_updated, running)
+            wrq(
+                &session,
+                client,
+                &path,
+                blksize,
+                &mut info,
+                want_oack,
+                max_retries,
+                log,
+                transfer_updated,
+                running,
+            )
         }
     })();
 
@@ -356,14 +381,14 @@ fn rrq(
     let sw = Instant::now();
 
     // OACK 之后客户端先 ACK 块 0（超时重发 OACK）
-    if let Some(oack) = oack_pkt {
-        if !wait_ack(ts, 0, &mut retr, max_retries, &mut buf, &|| {
+    if let Some(oack) = oack_pkt
+        && !wait_ack(ts, 0, &mut retr, max_retries, &mut buf, &|| {
             let _ = ts.send_to(oack, client);
-        }) {
-            info.error = Some("timeout waiting for initial ACK".into());
-            finish(info, sw, bytes, 0, retr, transfer_updated);
-            return Ok(());
-        }
+        })
+    {
+        info.error = Some("timeout waiting for initial ACK".into());
+        finish(info, sw, bytes, 0, retr, transfer_updated);
+        return Ok(());
     }
 
     let mut last = false;
@@ -387,7 +412,14 @@ fn rrq(
         block += 1;
         fire_progress(info, sw, transfer_updated);
     }
-    finish(info, sw, bytes, block.saturating_sub(1), retr, transfer_updated);
+    finish(
+        info,
+        sw,
+        bytes,
+        block.saturating_sub(1),
+        retr,
+        transfer_updated,
+    );
     log(
         LogLevel::Info,
         &format!(
@@ -610,7 +642,12 @@ fn read_cstring(pkt: &[u8], pos: &mut usize) -> String {
 
 /// 只取 basename，防目录穿越。
 fn safe_name(file_name: &str) -> String {
-    file_name.replace('\\', "/").rsplit('/').next().unwrap_or("").to_string()
+    file_name
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn finish(

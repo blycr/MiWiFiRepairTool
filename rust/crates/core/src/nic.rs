@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! 网卡枚举与配置（netsh）。
 //!
 //! 与 C# 版 NicManager 行为对齐：
@@ -12,8 +13,8 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_GATEWAY_ADDRESS_LH,
-    IP_ADAPTER_DHCP_ENABLED,
+    GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DHCP_ENABLED,
+    IP_ADAPTER_GATEWAY_ADDRESS_LH,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
 
@@ -276,7 +277,7 @@ pub fn restore_parts(
 
     // ip/mask 必须成对：只给了 IP 时用掩码兜底会改错掩码，直接报错
     if ip.is_some() && mask.is_none() {
-        return Err(format!("恢复参数不完整：缺少掩码（--mask）"));
+        return Err("恢复参数不完整：缺少掩码（--mask）".to_string());
     }
 
     let mut args = format!(
@@ -365,4 +366,27 @@ pub fn split_cmd_tokens(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_cmd_tokens;
+
+    #[test]
+    fn split_respects_quotes() {
+        let t = split_cmd_tokens(r#"add rule name="MiWiFi Repair" dir=in"#);
+        assert_eq!(t, vec!["add", "rule", "name=MiWiFi Repair", "dir=in"]);
+    }
+
+    #[test]
+    fn split_tabs_and_collapse_spaces() {
+        let t = split_cmd_tokens("a  b\tc");
+        assert_eq!(t, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn split_empty_input() {
+        assert!(split_cmd_tokens("").is_empty());
+        assert!(split_cmd_tokens("   ").is_empty());
+    }
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.1
 //! 租约表与 JSON 持久化（对应原版 `SOFTWARE\\RRT\\DHCP` 注册表持久化的现代替代）。
 
 use std::path::Path;
@@ -33,4 +34,43 @@ pub fn save(path: &Path, file: &LeaseFile) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn save_load_roundtrip() {
+        let mut p = std::env::temp_dir();
+        p.push(format!("miwifi_leases_test_{}.json", std::process::id()));
+        let f = LeaseFile {
+            leases: vec![LeaseRecord {
+                mac: "AA:BB:CC:DD:EE:FF".into(),
+                ip: "192.168.31.100".into(),
+                expires_unix: 12345,
+            }],
+        };
+        save(&p, &f).unwrap();
+        let loaded = load(&p);
+        assert_eq!(loaded.leases.len(), 1);
+        assert_eq!(loaded.leases[0].mac, "AA:BB:CC:DD:EE:FF");
+        assert_eq!(loaded.leases[0].ip, "192.168.31.100");
+        assert_eq!(loaded.leases[0].expires_unix, 12345);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn load_missing_or_broken_returns_empty() {
+        let p = PathBuf::from("Z:/definitely/not/exists.json");
+        assert!(load(&p).leases.is_empty());
+        // 损坏的 JSON 也应回退为空表
+        let mut bad = std::env::temp_dir();
+        bad.push(format!("miwifi_leases_bad_{}.json", std::process::id()));
+        std::fs::write(&bad, "{not json").unwrap();
+        assert!(load(&bad).leases.is_empty());
+        let _ = std::fs::remove_file(&bad);
+    }
 }
