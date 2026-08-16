@@ -1,28 +1,26 @@
-# Security Policy
+# 安全策略
 
-## Supported versions
+## 受支持版本
 
-Only the latest release is supported. See the [Releases](https://github.com/blycr/MiWiFiRepairTool/releases)
-page for the current version.
+仅支持最新发布版本。当前版本见 [Releases](https://github.com/blycr/MiWiFiRepairTool/releases) 页面。
 
-## Reporting a vulnerability
+## 报告漏洞
 
-Please report vulnerabilities through a **GitHub issue** on this repository
-(<https://github.com/blycr/MiWiFiRepairTool/issues>) so it is visible to the maintainer.
-If you prefer to keep details private, create the issue with a general title and request
-a private channel; the maintainer will reply as soon as possible.
+请通过本仓库的 **GitHub Issue**（<https://github.com/blycr/MiWiFiRepairTool/issues>）报告漏洞，
+以便维护者可见。如需保密细节，请先创建标题笼统的 Issue 并留言申请私密沟通渠道，
+维护者会尽快回复。
 
-There is **no bug bounty program**; thank you for reporting responsibly.
+本项目**不设漏洞赏金**，感谢你的负责任披露。
 
-## Scope and risk notes
+## 风险范围说明
 
-This tool performs privileged operations by design: transient UAC elevation for NIC and
-firewall configuration (netsh), DHCP (UDP 67) and TFTP (UDP 69) servers, and ARP/ICMP
-probes. It is intended to run on a machine you control, against a router you own.
+本工具按设计会执行特权操作：瞬时 UAC 提权（netsh 配置网卡与防火墙）、
+DHCP（UDP 67）与 TFTP（UDP 69）服务器、ARP/ICMP 探测。请仅在本人控制的机器、
+针对本人所有的路由器运行。
 
-Please include in your report:
+报告中请包含：
 
-- Affected version and architecture (x64/x86)
-- Reproduction steps (including any security software that interfered)
-- Observed behavior vs. expected behavior
-- `debug.log` from the program directory, if available
+- 受影响版本与架构（x64/x86）
+- 复现步骤（含干扰的安全软件）
+- 实际行为与预期行为的差异
+- 程序目录下的 `debug.log`（如可用）
