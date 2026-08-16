@@ -10,7 +10,7 @@ Rust 实现，Windows 10/11，**x64 与 x86（32 位）双架构**，无第三�
 > 反编译分析报告（`docs/ANALYSIS.md`）、C# 版代码走查（`docs/RUST_REWRITE_REVIEW.md`）、
 > 旧版二进制（`old/`）与开发环境文档（`docs/DEVELOPER.md`）属于内部材料，**仅本地保留**，不入公开仓库。
 
-> 早期还有一版 C#/.NET + WinForms 实现（`src/`、`MiWiFiRepairTool.slnx`），已被 Rust 命令行版取代；
+> 早期还有一版 C#/.NET + WinForms 实现（`archive/csharp/`），已被 Rust 命令行版取代；
 > 命令行版体验更舒适（进度条 / 状态指示 / 无窗口抖动），且 DHCP/TFTP 协议服务器需要编译型语言实现。
 > 构建 C# 版的本地环境坑见本机 `docs/DEVELOPER.md`（未随仓库分发）。
 
@@ -62,7 +62,7 @@ MiWiFiRepairTool/
 ├─ docs/
 │  ├─ CLI_DESIGN.md               # Rust 命令行版设计（交互 / 提权 / 安全）
 │  └─ CHANGELOG.md                # 版本变更记录
-├─ src/ + MiWiFiRepairTool.slnx   # 早期 C# 版（已废弃，归档）
+├─ archive/csharp/                # 早期 C# 版（已废弃，归档，含 slnx）
 ├─ Release/                       # 发布产物（git 忽略）
 ├─ LICENSE                        # EUPL 1.1（与上游 tftpd32 许可一致）
 ├─ NOTICE.md                      # 衍生关系与第三方声明（tftpd32/libcurl/小米）

@@ -1,9 +1,10 @@
-# Build output
+# Build output (C# legacy under archive/, Rust under rust/)
 bin/
 obj/
 out/
 publish/
 Release/
+*.pdb
 
 # IDE
 .vs/
