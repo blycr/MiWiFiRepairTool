@@ -74,8 +74,10 @@ docs/RUST_REWRITE_REVIEW.md（C# 走查）、docs/DEVELOPER.md（开发环境文
 
 ## 发布
 
-每版发布产物（zip + SHA256SUMS）输出到 `Release\v<版本>\`，并同步 GitHub Release（tag `v<版本>`）。
-每个版本发布 **x64 与 x86（32 位）** 两个架构包。当前版本：**v0.1**（第一版）。
+每版发布产物输出到 `Release\v<版本>\`，并同步 GitHub Release（tag `v<版本>`）。
+每个版本发布 **x64 与 x86（32 位）** 各一个**单文件 exe + 对应 SHA-256 校验文件**
+（`MiWiFiRepairTool-v<版本>-win-x64.exe/.sha256` 与 `...-win-x86.exe/.sha256`）。
+当前版本：**v0.1**（第一版）。
 
 ## 与旧版的关键差异
 
