@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>MiWiFiRepairTool.Core</AssemblyName>
+    <RootNamespace>MiWiFiRepairTool.Core</RootNamespace>
+    <Description>Core services for the MiWiFi repair tool: DHCP server, TFTP server, Xiaomi cloud ROM downloader, NIC manager.</Description>
+  </PropertyGroup>
+
+</Project>

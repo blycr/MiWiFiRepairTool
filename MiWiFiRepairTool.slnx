@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MiWiFiRepairTool.Core/MiWiFiRepairTool.Core.csproj" />
+  </Folder>
+  <Folder Name="/src/MiWiFiRepairTool.App/">
+    <Project Path="src/MiWiFiRepairTool.App/MiWiFiRepairTool.csproj" />
+  </Folder>
+</Solution>

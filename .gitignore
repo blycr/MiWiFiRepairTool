@@ -1,0 +1,38 @@
+# Build output
+bin/
+obj/
+out/
+publish/
+Release/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+
+# Local dotnet CLI / NuGet caches
+.dotnet-cli/
+.nuget-cache/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+
+# Binary analysis scratch (decompilation artifacts)
+.ana/
+
+# Rust build output & local cargo cache (workspace-internal)
+rust/target/
+rust/.cargo-home/
+
+# Local-only sensitive docs & archives (NOT pushed to public GitHub)
+old/
+docs/ANALYSIS.md
+docs/DEVELOPER.md
+docs/RUST_REWRITE_REVIEW.md
