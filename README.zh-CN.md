@@ -1,5 +1,7 @@
 # 小米路由器修复工具（MiWiFiRepairTool）
 
+[English（English README）](README.md)
+
 对旧版 `MIWIFIRepairTool.x86.exe`（2019，32 位，基于 tftpd32 定制）的**纯命令行重写**，
 用于修复小米路由器（小米路由器 4 / 4Q / 4C）。
 

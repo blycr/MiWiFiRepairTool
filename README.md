@@ -1,5 +1,7 @@
 # MiWiFiRepairTool
 
+**简体中文** · [简体中文文档（README.zh-CN.md）](README.zh-CN.md)
+
 A pure **command-line** rewrite of the legacy `MIWIFIRepairTool.x86.exe` (2019, 32-bit,
 built on a customized tftpd32) for recovering Xiaomi MiWiFi routers (Mi Router 4 / 4Q / 4C).
 
