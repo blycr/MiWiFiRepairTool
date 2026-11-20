@@ -19,10 +19,10 @@ cd rust
 cargo build --release                          # x64
 cargo build --release --target i686-pc-windows-msvc   # x86
 
-cargo test -p miwifi-repair-core               # 单元测试
-cargo run -p miwifi-repair-selftest            # 集成自检（期望 SELFTEST: ALL PASS）
-cargo clippy --all-targets -- -D warnings      # 静态检查（必须 0 警告）
-cargo fmt --all -- --check                     # 格式检查（必须通过）
+cargo test --workspace                               # 全工作区单元测试
+cargo run -p miwifi-repair-selftest                  # 集成自检（期望 SELFTEST: ALL PASS）
+cargo clippy --all-targets -- -D warnings            # 静态检查（必须 0 警告）
+cargo fmt --all -- --check                           # 格式检查（必须通过）
 ```
 
 `CARGO_HOME` 默认使用用户缓存；如需离线/可复现构建，可把缓存指向仓库内的
@@ -41,12 +41,12 @@ cargo fmt --all -- --check                     # 格式检查（必须通过）
 | crate | 职责 |
 | --- | --- |
 | `crates/core` | 协议核心：DHCP、TFTP、ROM 列表/下载、网卡管理、探测、日志、自检逻辑 |
-| `crates/app` | 命令行应用：`cli`（入口/共享状态）、`menu`（主菜单）、`session`（会话）、`status`（状态视图）、`help`（说明）、`util`（提权/防火墙/控制台） |
+| `crates/app` | 命令行应用：`cli`（入口/共享状态）、`guardian`（单次 UAC 守护提权与断电快照）、`layout`（自适应左右分栏）、`menu`（主菜单）、`session`（会话与实时链路诊断）、`status`（状态视图）、`help`（说明）、`util`（平台工具） |
 | `crates/selftest` | 无头自检入口（回环 DHCP/TFTP + 云端在线检查） |
 
 提权模型与数据流见 [docs/architecture.md](docs/architecture.md)。
-以下安全行为属设计意图，**不得削弱**：瞬时提权（不弹新控制台）、TFTP 只读下发、
-基于快照的网卡恢复、被拦截时明确警告。
+以下安全行为属设计意图，**不得削弱**：单次 UAC 守护提权（不弹新控制台、断连/崩溃自动恢复）、
+TFTP 只读单文件隔离、基于完整快照（含网关）的网卡恢复、被拦截时明确警告。
 
 ## PR 流程
 

@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: EUPL-1.1
-//! 回环自检（行为对齐 C# 版 SelfTest）：退出码 0 = 全部通过。
+//! 回环自检（退出码 0 = 全部通过）。
+//!
+//! 覆盖：
+//! - DHCP 全流程（Discover/Offer/Request/Ack/Nak/Inform/Release，含 `192.168.31.100` Server ID、
+//!   `.101–.200` 地址池、`.1` 网关、BOOTP `file` 与 Option 67 刷机包名）；
+//! - TFTP RRQ（RFC 2347 单选项 OACK + 100KB 数据完整性 + 512 整数倍 0 字节尾块 + 单文件异名映射）；
+//! - TFTP WRQ 只读拒绝（ERROR code 2）；
+//! - TFTP 缺失文件（ERROR code 1）；
+//! - ROM 列表解析（含 `http://http://` 双前缀脏数据）与云端在线检查。
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -14,6 +22,11 @@ pub fn run() -> i32 {
     let mut fails = 0;
     fails += if test_dhcp() { 0 } else { 1 };
     fails += if test_tftp_rrq() { 0 } else { 1 };
+    fails += if test_tftp_single_file_fallback() {
+        0
+    } else {
+        1
+    };
     fails += if test_tftp_wrq() { 0 } else { 1 };
     fails += if test_tftp_not_found() { 0 } else { 1 };
     fails += if test_rom_parse() { 0 } else { 1 };
@@ -29,23 +42,23 @@ pub fn run() -> i32 {
 // ================================================================ DHCP
 
 fn test_dhcp() -> bool {
-    print!("DHCP discover/offer/request/ack/nak ... ");
+    print!("DHCP discover/offer/request/ack/nak/inform + bootfile ... ");
     let mac1: [u8; 6] = [0x04, 0x67, 0x61, 0x9A, 0x3A, 0x3C];
     let mac2: [u8; 6] = [0x04, 0x67, 0x61, 0x9A, 0x3A, 0x3D];
-    let mut server = DhcpServer::with_bind(
-        Ipv4Addr::new(192, 168, 31, 1),
-        Ipv4Addr::new(192, 168, 31, 100),
-        100,
-        Ipv4Addr::LOCALHOST,
-    );
+    let server_ip = Ipv4Addr::new(192, 168, 31, 100);
+    let pool_start = Ipv4Addr::new(192, 168, 31, 101);
+    let gateway_ip = Ipv4Addr::new(192, 168, 31, 1);
+
+    let mut server = DhcpServer::with_bind(server_ip, pool_start, 100, Ipv4Addr::LOCALHOST);
+    server.set_gateway(gateway_ip);
+    server.set_boot_file("miwifi_r4_firmware_selftest.bin".into());
     server.set_log(std::sync::Arc::new(|_, _| {}));
     if let Err(e) = server.start() {
         println!("FAIL (启动失败: {e})");
         return false;
     }
 
-    let cli = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 68));
-    let cli = match cli {
+    let cli = match UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 68)) {
         Ok(s) => s,
         Err(e) => {
             println!("FAIL (bind 68: {e})");
@@ -56,85 +69,104 @@ fn test_dhcp() -> bool {
     let _ = cli.set_read_timeout(Some(Duration::from_secs(3)));
     let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::DHCP_SERVER_PORT);
 
-    // --- DISCOVER -> OFFER
-    let _ = cli.send_to(&build_dhcp(0x12345678, &mac1, 1, None, None, 0), srv);
-    let offer = recv_dhcp(&cli);
-    let Some(offer) = offer else {
-        println!("FAIL (no OFFER)");
-        server.stop();
-        return false;
-    };
-    let yiaddr = be32(&offer, 16);
-    if !(0xC0A81F64..=0xC0A81FC7).contains(&yiaddr) {
-        println!("FAIL (yiaddr 0x{:08X})", yiaddr);
-        server.stop();
-        return false;
-    }
-    if get_opt(&offer, 53).map(|v| v[0]) != Some(2) {
-        println!("FAIL (option 53 != OFFER)");
-        server.stop();
-        return false;
-    }
-    if get_opt(&offer, 54).map(|v| be32(v, 0)) != Some(0xC0A81F01) {
-        println!("FAIL (server id)");
-        server.stop();
-        return false;
-    }
-    if get_opt(&offer, 1).map(|v| be32(v, 0)) != Some(0xFFFFFF00) {
-        println!("FAIL (subnet mask)");
-        server.stop();
-        return false;
-    }
-    if get_opt(&offer, 3).map(|v| be32(v, 0)) != Some(0xC0A81F01) {
-        println!("FAIL (router option)");
-        server.stop();
-        return false;
-    }
+    let ok = (|| -> Result<(), String> {
+        // --- DISCOVER -> OFFER
+        cli.send_to(&build_dhcp(0x12345678, &mac1, 1, None, None, 0), srv)
+            .map_err(|e| e.to_string())?;
+        let offer = recv_dhcp(&cli).ok_or("no OFFER")?;
+        let yiaddr = be32(&offer, 16);
+        // 池范围 192.168.31.101 (0xC0A81F65) ..= 192.168.31.200 (0xC0A81FC8)
+        if !(0xC0A8_1F65..=0xC0A8_1FC8).contains(&yiaddr) {
+            return Err(format!("yiaddr 0x{yiaddr:08X} outside .101-.200"));
+        }
+        if be32(&offer, 20) != 0xC0A8_1F64 {
+            return Err("siaddr != 192.168.31.100".into());
+        }
+        if read_cstr(&offer[108..236]) != "miwifi_r4_firmware_selftest.bin" {
+            return Err("BOOTP file field mismatch".into());
+        }
+        if get_opt(&offer, 53).and_then(|v| v.first().copied()) != Some(2) {
+            return Err("option 53 != OFFER".into());
+        }
+        if get_opt(&offer, 54).map(|v| be32(v, 0)) != Some(0xC0A8_1F64) {
+            return Err("server id != 192.168.31.100".into());
+        }
+        if get_opt(&offer, 1).map(|v| be32(v, 0)) != Some(0xFFFF_FF00) {
+            return Err("subnet mask != 255.255.255.0".into());
+        }
+        if get_opt(&offer, 3).map(|v| be32(v, 0)) != Some(0xC0A8_1F01) {
+            return Err("router option != 192.168.31.1".into());
+        }
+        if get_opt(&offer, 67) != Some(b"miwifi_r4_firmware_selftest.bin".as_slice()) {
+            return Err("option 67 mismatch".into());
+        }
 
-    // --- REQUEST -> ACK
-    let _ = cli.send_to(
-        &build_dhcp(0x12345678, &mac1, 3, Some(yiaddr), Some(0xC0A81F01), 0),
-        srv,
-    );
-    let ack = recv_dhcp(&cli);
-    let Some(ack) = ack else {
-        println!("FAIL (no ACK)");
-        server.stop();
-        return false;
-    };
-    if get_opt(&ack, 53).map(|v| v[0]) != Some(5) {
-        println!("FAIL (option 53 != ACK)");
-        server.stop();
-        return false;
-    }
-    if be32(&ack, 16) != yiaddr {
-        println!("FAIL (ACK yiaddr differs)");
-        server.stop();
-        return false;
-    }
+        // --- REQUEST -> ACK
+        cli.send_to(
+            &build_dhcp(0x12345678, &mac1, 3, Some(yiaddr), Some(0xC0A8_1F64), 0),
+            srv,
+        )
+        .map_err(|e| e.to_string())?;
+        let ack = recv_dhcp(&cli).ok_or("no ACK")?;
+        if get_opt(&ack, 53).and_then(|v| v.first().copied()) != Some(5) {
+            return Err("option 53 != ACK".into());
+        }
+        if be32(&ack, 16) != yiaddr {
+            return Err("ACK yiaddr differs".into());
+        }
+        if read_cstr(&ack[108..236]) != "miwifi_r4_firmware_selftest.bin" {
+            return Err("ACK BOOTP file mismatch".into());
+        }
 
-    // --- REQUEST outside pool (fresh MAC) -> NAK
-    let _ = cli.send_to(
-        &build_dhcp(0xDEADBEEF, &mac2, 3, Some(0xC0A81FFA), Some(0xC0A81F01), 0),
-        srv,
-    );
-    let nak = recv_dhcp(&cli);
-    let Some(nak) = nak else {
-        println!("FAIL (no NAK)");
-        server.stop();
-        return false;
-    };
-    if get_opt(&nak, 53).map(|v| v[0]) != Some(6) {
-        println!("FAIL (option 53 != NAK)");
-        server.stop();
-        return false;
-    }
+        // --- REQUEST outside pool -> NAK (不含 option 51/1/3)
+        cli.send_to(
+            &build_dhcp(
+                0xDEADBEEF,
+                &mac2,
+                3,
+                Some(0xC0A8_1FFA),
+                Some(0xC0A8_1F64),
+                0,
+            ),
+            srv,
+        )
+        .map_err(|e| e.to_string())?;
+        let nak = recv_dhcp(&cli).ok_or("no NAK")?;
+        if get_opt(&nak, 53).and_then(|v| v.first().copied()) != Some(6) {
+            return Err("option 53 != NAK".into());
+        }
+        if get_opt(&nak, 51).is_some() || get_opt(&nak, 1).is_some() {
+            return Err("NAK must not carry lease/subnet options".into());
+        }
 
-    // --- RELEASE
-    let _ = cli.send_to(&build_dhcp(0x12345678, &mac1, 7, None, None, yiaddr), srv);
+        // --- INFORM -> ACK (回显 ciaddr，无租期选项)
+        cli.send_to(&build_dhcp(0x22334455, &mac1, 8, None, None, yiaddr), srv)
+            .map_err(|e| e.to_string())?;
+        let inform = recv_dhcp(&cli).ok_or("no INFORM ACK")?;
+        if get_opt(&inform, 53).and_then(|v| v.first().copied()) != Some(5) {
+            return Err("INFORM reply != ACK".into());
+        }
+        if be32(&inform, 12) != yiaddr || get_opt(&inform, 51).is_some() {
+            return Err("INFORM ciaddr/options invalid".into());
+        }
+
+        // --- RELEASE
+        cli.send_to(&build_dhcp(0x12345678, &mac1, 7, None, None, yiaddr), srv)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+
     server.stop();
-    println!("PASS");
-    true
+    match ok {
+        Ok(()) => {
+            println!("PASS");
+            true
+        }
+        Err(e) => {
+            println!("FAIL ({e})");
+            false
+        }
+    }
 }
 
 fn recv_dhcp(cli: &UdpSocket) -> Option<Vec<u8>> {
@@ -143,6 +175,11 @@ fn recv_dhcp(cli: &UdpSocket) -> Option<Vec<u8>> {
         Ok((n, _)) if n >= 240 => Some(buf[..n].to_vec()),
         _ => None,
     }
+}
+
+fn read_cstr(slice: &[u8]) -> String {
+    let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    String::from_utf8_lossy(&slice[..end]).into_owned()
 }
 
 fn build_dhcp(
@@ -160,7 +197,7 @@ fn build_dhcp(
     put_be32(&mut b, 4, xid);
     put_be32(&mut b, 12, ciaddr);
     b[28..34].copy_from_slice(mac);
-    put_be32(&mut b, 236, 0x63825363);
+    put_be32(&mut b, 236, 0x6382_5363);
     let mut o = 240;
     b[o] = 53;
     b[o + 1] = 1;
@@ -211,10 +248,9 @@ fn get_opt(pkt: &[u8], code: u8) -> Option<&[u8]> {
 // ================================================================ TFTP
 
 fn test_tftp_rrq() -> bool {
-    print!("TFTP RRQ (OACK + data integrity) ... ");
+    print!("TFTP RRQ (RFC 2347 OACK + data integrity) ... ");
     let root = make_temp_root();
     let ok = (|| -> Result<(), String> {
-        // 伪随机数据
         let file_bytes = pseudo_random(100_000, 42);
         std::fs::write(root.join("selftest_rom.bin"), &file_bytes).map_err(|e| e.to_string())?;
         let exact_bytes = pseudo_random(1024, 42);
@@ -224,19 +260,21 @@ fn test_tftp_rrq() -> bool {
         server.set_log(std::sync::Arc::new(|_, _| {}));
         server.start().map_err(|e| e.to_string())?;
 
-        let cli = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
-            .map_err(|e| e.to_string())?;
-        let _ = cli.set_read_timeout(Some(Duration::from_secs(3)));
-        let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::TFTP_PORT);
+        let r = (|| -> Result<(), String> {
+            let cli = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+                .map_err(|e| e.to_string())?;
+            let _ = cli.set_read_timeout(Some(Duration::from_secs(3)));
+            let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::TFTP_PORT);
 
-        let r1 = download_file(&cli, srv, "selftest_rom.bin", &file_bytes, None);
-        r1.map_err(|e| format!("selftest_rom.bin: {e}"))?;
-        // 512 整数倍 → 必须发送 0 字节尾块（3 个 DATA 包）
-        let r2 = download_file(&cli, srv, "exact.bin", &exact_bytes, Some(3));
-        r2.map_err(|e| format!("exact.bin: {e}"))?;
-
+            download_file(&cli, srv, "selftest_rom.bin", &file_bytes, None)
+                .map_err(|e| format!("selftest_rom.bin: {e}"))?;
+            // 512 整数倍 → 必须发送 0 字节尾块（3 个 DATA 包）
+            download_file(&cli, srv, "exact.bin", &exact_bytes, Some(3))
+                .map_err(|e| format!("exact.bin: {e}"))?;
+            Ok(())
+        })();
         server.stop();
-        Ok(())
+        r
     })();
 
     cleanup_root(&root);
@@ -252,18 +290,55 @@ fn test_tftp_rrq() -> bool {
     }
 }
 
-/// 伪随机字节（确定性，替代 C# Random(seed)）。
+fn test_tftp_single_file_fallback() -> bool {
+    print!("TFTP single-file mode (exact + fallback mapping) ... ");
+    let root = make_temp_root();
+    let ok = (|| -> Result<(), String> {
+        let fw_bytes = pseudo_random(2048 + 17, 99);
+        let fw_path = root.join("miwifi_r4_selected.bin");
+        std::fs::write(&fw_path, &fw_bytes).map_err(|e| e.to_string())?;
+
+        let mut server = TftpServer::single_file(fw_path, Ipv4Addr::LOCALHOST, true);
+        server.set_log(std::sync::Arc::new(|_, _| {}));
+        server.start().map_err(|e| e.to_string())?;
+
+        let r = (|| -> Result<(), String> {
+            let cli = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+                .map_err(|e| e.to_string())?;
+            let _ = cli.set_read_timeout(Some(Duration::from_secs(3)));
+            let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::TFTP_PORT);
+
+            // 模拟忽略 DHCP bootfile、直接请求 C0A81F65.img 的路由器
+            download_file(&cli, srv, "C0A81F65.img", &fw_bytes, None)?;
+            Ok(())
+        })();
+        server.stop();
+        r
+    })();
+
+    cleanup_root(&root);
+    match ok {
+        Ok(()) => {
+            println!("PASS");
+            true
+        }
+        Err(e) => {
+            println!("FAIL ({e})");
+            false
+        }
+    }
+}
+
 fn pseudo_random(len: usize, seed: u32) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+    let mut state = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
     (0..len)
         .map(|_| {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (state >> 24) as u8
         })
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn download_file(
     cli: &UdpSocket,
     srv: SocketAddr,
@@ -271,30 +346,27 @@ fn download_file(
     expected: &[u8],
     expect_packets: Option<usize>,
 ) -> Result<(), String> {
-    // RRQ + blksize=512 + timeout=5
+    // 仅请求 timeout=5（与真实小米路由器 tftp.log 一致），验证 OACK 不夹带未请求的 blksize/tsize
     let mut rrq = vec![0u8, 1];
     rrq.extend_from_slice(file_name.as_bytes());
     rrq.push(0);
-    rrq.extend_from_slice(b"octet");
-    rrq.push(0);
-    rrq.extend_from_slice(b"blksize");
-    rrq.push(0);
-    rrq.extend_from_slice(b"512");
-    rrq.push(0);
-    rrq.extend_from_slice(b"timeout");
-    rrq.push(0);
-    rrq.extend_from_slice(b"5");
-    rrq.push(0);
+    rrq.extend_from_slice(b"octet\x00timeout\x005\x00");
     cli.send_to(&rrq, srv).map_err(|e| e.to_string())?;
 
     let mut buf = [0u8; 2048];
     let (n, from) = cli
         .recv_from(&mut buf)
         .map_err(|_| "timeout waiting OACK".to_string())?;
-    let _ = n;
     let op = ((buf[0] as u16) << 8) | buf[1] as u16;
     if op != 6 {
         return Err("expected OACK".into());
+    }
+    // 校验 OACK 仅含 timeout=5
+    if &buf[2..n] != b"timeout\x005\x00" {
+        return Err(format!(
+            "unexpected OACK payload: {:?}",
+            String::from_utf8_lossy(&buf[2..n])
+        ));
     }
     cli.send_to(&[0u8, 4, 0, 0], from)
         .map_err(|e| e.to_string())?;
@@ -340,8 +412,6 @@ fn download_file(
 }
 
 fn test_tftp_wrq() -> bool {
-    // 安全策略：WRQ（上传）一律拒绝（code 2 Access violation），且不创建文件。
-    // 刷机只需 RRQ（路由器下载固件）；开放 WRQ 会让任意 LAN 主机覆盖程序目录文件。
     print!("TFTP WRQ rejected (upload disabled) ... ");
     let root = make_temp_root();
     let ok = (|| -> Result<(), String> {
@@ -355,10 +425,7 @@ fn test_tftp_wrq() -> bool {
             let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::TFTP_PORT);
 
             let mut wrq = vec![0u8, 2];
-            wrq.extend_from_slice(b"upload.bin");
-            wrq.push(0);
-            wrq.extend_from_slice(b"octet");
-            wrq.push(0);
+            wrq.extend_from_slice(b"upload.bin\0octet\0");
             cli.send_to(&wrq, srv).map_err(|e| e.to_string())?;
 
             let mut buf = [0u8; 2048];
@@ -374,14 +441,8 @@ fn test_tftp_wrq() -> bool {
                     "expected error code 2 (Access violation), got {code}"
                 ));
             }
-            // 拒绝上传时不得创建目标文件
             if root.join("upload.bin").exists() {
                 return Err("upload file must not be created".into());
-            }
-            // 稍等片刻确认服务器没有创建文件（WRQ 走拒绝路径）
-            std::thread::sleep(Duration::from_millis(100));
-            if root.join("upload.bin").exists() {
-                return Err("upload file created despite rejection".into());
             }
             Ok(())
         })();
@@ -410,25 +471,25 @@ fn test_tftp_not_found() -> bool {
         server.set_log(std::sync::Arc::new(|_, _| {}));
         server.start().map_err(|e| e.to_string())?;
 
-        let cli = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
-            .map_err(|e| e.to_string())?;
-        let _ = cli.set_read_timeout(Some(Duration::from_secs(3)));
-        let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::TFTP_PORT);
+        let r = (|| -> Result<(), String> {
+            let cli = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+                .map_err(|e| e.to_string())?;
+            let _ = cli.set_read_timeout(Some(Duration::from_secs(3)));
+            let srv = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), crate::config::TFTP_PORT);
 
-        let mut rrq = vec![0u8, 1];
-        rrq.extend_from_slice(b"nope.bin");
-        rrq.push(0);
-        rrq.extend_from_slice(b"octet");
-        rrq.push(0);
-        cli.send_to(&rrq, srv).map_err(|e| e.to_string())?;
+            let mut rrq = vec![0u8, 1];
+            rrq.extend_from_slice(b"nope.bin\0octet\0");
+            cli.send_to(&rrq, srv).map_err(|e| e.to_string())?;
 
-        let mut buf = [0u8; 2048];
-        let (n, _) = cli.recv_from(&mut buf).map_err(|_| "timeout".to_string())?;
-        if n < 2 || ((buf[0] as u16) << 8 | buf[1] as u16) != 5 {
-            return Err("expected ERROR".into());
-        }
+            let mut buf = [0u8; 2048];
+            let (n, _) = cli.recv_from(&mut buf).map_err(|_| "timeout".to_string())?;
+            if n < 2 || ((buf[0] as u16) << 8 | buf[1] as u16) != 5 {
+                return Err("expected ERROR".into());
+            }
+            Ok(())
+        })();
         server.stop();
-        Ok(())
+        r
     })();
 
     cleanup_root(&root);

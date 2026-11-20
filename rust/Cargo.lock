@@ -334,6 +334,8 @@ name = "miwifi-repair-app"
 version = "0.1.0"
 dependencies = [
  "miwifi-repair-core",
+ "serde",
+ "serde_json",
  "windows-sys 0.59.0",
 ]
 

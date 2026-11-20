@@ -77,7 +77,11 @@ impl Logger {
 
     /// 订阅日志行（UI 用）。回调收到 (级别, 完整行)。仅在级别 >= 当前 UI 级别时触发。
     pub fn subscribe(&self, cb: impl Fn(LogLevel, &str) + Send + Sync + 'static) {
-        self.inner.callbacks.lock().unwrap().push(Box::new(cb));
+        self.inner
+            .callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Box::new(cb));
     }
 
     /// 设置订阅者（UI）可见的最低级别。默认 Info。
@@ -88,7 +92,7 @@ impl Logger {
     /// 可选落盘（追加模式，记录全部级别，尽力而为）。用于 tftp.log / debug.log。
     pub fn set_file(&self, path: PathBuf) {
         let f = File::options().create(true).append(true).open(path).ok();
-        *self.inner.file.lock().unwrap() = f;
+        *self.inner.file.lock().unwrap_or_else(|e| e.into_inner()) = f;
     }
 
     /// 输出一行（自动加时间戳与级别标签）。
@@ -104,12 +108,22 @@ impl Logger {
             )
         };
         // 文件：全量
-        if let Some(f) = self.inner.file.lock().unwrap().as_mut() {
+        if let Some(f) = self
+            .inner
+            .file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
             let _ = writeln!(f, "{line}");
         }
         // 订阅者：级别过滤
         if (level as u8) >= self.inner.ui_min.load(Ordering::SeqCst) {
-            let cbs = self.inner.callbacks.lock().unwrap();
+            let cbs = self
+                .inner
+                .callbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for cb in cbs.iter() {
                 cb(level, &line);
             }

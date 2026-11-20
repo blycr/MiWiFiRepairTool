@@ -1,34 +1,49 @@
 // SPDX-License-Identifier: EUPL-1.1
-//! TFTP 服务器（RFC 1350 + 2347/2348/2349），行为对齐 C# 版 TftpServer。
+//! 只读 TFTP 服务器（RFC 1350 + 2347/2348/2349 + RFC 1123 §4.2.3.1）。
 //!
-//! - RRQ（下载）/WRQ（上传，**一律拒绝**：刷机只需只读下发，防止覆盖程序目录文件），
-//!   blksize/timeout/tsize 协商（OACK）
-//! - 每会话独立 socket（端口 0），多会话并行
-//! - 超时重传（默认 5s × 5 次）
-//! - SafeName：文件名只取 basename，防目录穿越
-//! - 512 整数倍文件发送 0 字节尾块
+//! 关键特性：
+//! - **只读下发**：WRQ（上传）一律拒绝（ERROR code 2），防止覆盖本地文件；
+//! - **单文件隔离模式**（`SingleFile`）：生产刷机仅托管用户选中的刷机包，不暴露程序目录其他文件，
+//!   同时支持对忽略 DHCP `bootfile`、请求固定名（如 `C0A81Fxx.img` / `miwifi.bin`）的路由器自动映射；
+//! - **严格 RFC 2347 OACK**：仅回传客户端实际请求的受支持选项（`blksize`/`timeout`/`tsize`）；
+//! - **严格 RFC 1123**：不因重复 ACK 立即重发（避免 Sorcerer's Apprentice），按真实截止时间超时重传，
+//!   使用 `recv_from` 校验对端 TID，并循环读满块以杜绝短读截断固件；
+//! - **可中断与活跃监控**：`stop()` 在 250ms 内中止所有进行中会话；暴露 `last_activity_unix()`
+//!   与 `active_transfers()` 供连接检查准确判断状态。
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{TFTP_DEFAULT_TIMEOUT_SECONDS, TFTP_MAX_RETRIES, TFTP_PORT};
 use crate::log::LogLevel;
+use crate::rom::is_safe_filename;
 
 type LogFn = Arc<dyn Fn(LogLevel, &str) + Send + Sync>;
 type TransferFn = Arc<dyn Fn(TransferInfo) + Send + Sync>;
+
+/// TFTP 文件托管模式。
+#[derive(Clone, Debug)]
+pub enum TftpTarget {
+    /// 目录模式（用于自检/通用测试；严格校验单段安全文件名，防目录穿越与 Windows 盘符逃逸）。
+    Directory(PathBuf),
+    /// 单文件隔离模式（刷机推荐）：仅提供指定固件文件。
+    /// `allow_fallback = true` 时，若路由器请求其他文件名（如 `C0A81Fxx.img` / `miwifi.bin`），
+    /// 自动映射下发该固件并记录明确日志。
+    SingleFile { path: PathBuf, allow_fallback: bool },
+}
 
 /// 一次传输的统计信息（UI 用）。
 #[derive(Clone, Debug, Default)]
 pub struct TransferInfo {
     pub file_name: String,
     pub remote: String,
-    /// RRQ 为文件大小；WRQ 未知（-1）
+    /// 文件总字节数
     pub total_bytes: i64,
     pub is_upload: bool,
     pub bytes_sent: u64,
@@ -41,36 +56,74 @@ pub struct TransferInfo {
 
 /// TFTP 服务器。
 pub struct TftpServer {
-    root: PathBuf,
+    target: TftpTarget,
     bind: Ipv4Addr,
+    port: u16,
     default_timeout: u32,
     max_retries: u32,
     running: Arc<AtomicBool>,
     listener: Arc<Mutex<Option<UdpSocket>>>,
-    sessions: Arc<Mutex<Vec<Arc<UdpSocket>>>>,
+    last_activity: Arc<AtomicU64>,
+    active_transfers: Arc<AtomicUsize>,
+    session_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     log: LogFn,
     transfer_updated: Option<TransferFn>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl TftpServer {
+    /// 目录模式（默认监听 `0.0.0.0:69`）。
     pub fn new(root: PathBuf) -> Self {
         Self::with_bind(root, Ipv4Addr::UNSPECIFIED)
     }
 
+    /// 目录模式 + 指定监听地址。
     pub fn with_bind(root: PathBuf, bind: Ipv4Addr) -> Self {
-        Self {
-            root,
+        Self::with_target(TftpTarget::Directory(root), bind)
+    }
+
+    /// 单文件隔离模式 + 指定监听地址（生产刷机使用）。
+    pub fn single_file(path: PathBuf, bind: Ipv4Addr, allow_fallback: bool) -> Self {
+        Self::with_target(
+            TftpTarget::SingleFile {
+                path,
+                allow_fallback,
+            },
             bind,
+        )
+    }
+
+    fn with_target(target: TftpTarget, bind: Ipv4Addr) -> Self {
+        Self {
+            target,
+            bind,
+            port: TFTP_PORT,
             default_timeout: TFTP_DEFAULT_TIMEOUT_SECONDS,
             max_retries: TFTP_MAX_RETRIES,
             running: Arc::new(AtomicBool::new(false)),
             listener: Arc::new(Mutex::new(None)),
-            sessions: Arc::new(Mutex::new(Vec::new())),
-            log: Arc::new(|_: crate::log::LogLevel, _: &str| {}),
+            last_activity: Arc::new(AtomicU64::new(0)),
+            active_transfers: Arc::new(AtomicUsize::new(0)),
+            session_threads: Arc::new(Mutex::new(Vec::new())),
+            log: Arc::new(|_: LogLevel, _: &str| {}),
             transfer_updated: None,
             thread: Mutex::new(None),
         }
+    }
+
+    /// 自定义监听端口（单元测试用 `0` 避免冲突）。
+    pub fn set_port(&mut self, port: u16) {
+        self.port = port;
+    }
+
+    /// 获取当前已绑定端口。
+    pub fn local_port(&self) -> Option<u16> {
+        self.listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.port())
     }
 
     pub fn set_log(&mut self, f: LogFn) {
@@ -81,21 +134,53 @@ impl TftpServer {
         self.transfer_updated = Some(f);
     }
 
+    /// 最近一次收到 TFTP 请求或有效 ACK 的时间（Unix 秒）。0 = 尚未有活动。
+    pub fn last_activity_unix(&self) -> u64 {
+        self.last_activity.load(Ordering::SeqCst)
+    }
+
+    /// 当前正在进行的 TFTP 传输数量。
+    pub fn active_transfers(&self) -> usize {
+        self.active_transfers.load(Ordering::SeqCst)
+    }
+
+    /// TFTP 监听 socket 当前是否已成功绑定（链路未通等待重绑期间为 false）。
+    pub fn is_bound(&self) -> bool {
+        self.listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     pub fn start(&mut self) -> Result<(), String> {
-        let addr = SocketAddr::new(self.bind.into(), TFTP_PORT);
-        let socket = UdpSocket::bind(addr).map_err(|e| format!("绑定 {addr} 失败: {e}"))?;
-        let _ = socket.set_read_timeout(Some(Duration::from_millis(250)));
+        let addr = SocketAddr::new(self.bind.into(), self.port);
+        let initial_socket = match bind_tftp_socket(addr) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == ErrorKind::AddrNotAvailable && !self.bind.is_unspecified() => {
+                (self.log)(
+                    LogLevel::Warn,
+                    &format!(
+                        "网卡地址 {addr} 尚未就绪（网线可能未连接或路由器未上电），将在链路恢复后自动绑定 TFTP。"
+                    ),
+                );
+                None
+            }
+            Err(e) => return Err(format!("绑定 {addr} 失败: {e}")),
+        };
 
         self.running.store(true, Ordering::SeqCst);
-        *self.listener.lock().unwrap() = Some(socket);
+        *self.listener.lock().unwrap_or_else(|e| e.into_inner()) = initial_socket;
 
         let running = self.running.clone();
         let listener = self.listener.clone();
-        let sessions = self.sessions.clone();
+        let last_activity = self.last_activity.clone();
+        let active_transfers = self.active_transfers.clone();
+        let session_threads = self.session_threads.clone();
         let log = self.log.clone();
         let transfer_updated = self.transfer_updated.clone();
-        let root = self.root.clone();
+        let target = self.target.clone();
         let bind = self.bind;
+        let bind_addr = addr;
         let default_timeout = self.default_timeout;
         let max_retries = self.max_retries;
 
@@ -104,10 +189,37 @@ impl TftpServer {
             .spawn(move || {
                 let mut buffer = [0u8; 2048];
                 while running.load(Ordering::SeqCst) {
+                    // 定期清理已结束的会话线程句柄，防止 Vec 无限增长
+                    {
+                        let mut threads = session_threads.lock().unwrap_or_else(|e| e.into_inner());
+                        threads.retain(|h| !h.is_finished());
+                    }
+
+                    // 延迟绑定（等待网卡链路就绪）
+                    {
+                        let mut g = listener.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.is_none() {
+                            match bind_tftp_socket(bind_addr) {
+                                Ok(s) => {
+                                    log(
+                                        LogLevel::Info,
+                                        &format!("TFTP 服务已就绪，监听 {bind_addr}"),
+                                    );
+                                    *g = Some(s);
+                                }
+                                Err(_) => {
+                                    drop(g);
+                                    std::thread::sleep(Duration::from_millis(500));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     let r = {
-                        let g = listener.lock().unwrap();
+                        let g = listener.lock().unwrap_or_else(|e| e.into_inner());
                         match g.as_ref() {
-                            None => break,
+                            None => continue,
                             Some(s) => s.recv_from(&mut buffer),
                         }
                     };
@@ -118,17 +230,19 @@ impl TftpServer {
                             }
                             let op = ((buffer[0] as u16) << 8) | buffer[1] as u16;
                             if op == 1 || op == 2 {
+                                last_activity.store(now_unix(), Ordering::SeqCst);
                                 let pkt = buffer[..n].to_vec();
                                 let log = log.clone();
                                 let transfer_updated = transfer_updated.clone();
-                                let root = root.clone();
-                                let sessions = sessions.clone();
+                                let target = target.clone();
                                 let running = running.clone();
-                                let _ = std::thread::Builder::new()
+                                let last_activity = last_activity.clone();
+                                let active_transfers = active_transfers.clone();
+                                if let Ok(th) = std::thread::Builder::new()
                                     .name("tftp-session".into())
                                     .spawn(move || {
                                         let result = handle_transfer(
-                                            &root,
+                                            &target,
                                             bind,
                                             default_timeout,
                                             max_retries,
@@ -137,8 +251,9 @@ impl TftpServer {
                                             &pkt,
                                             &log,
                                             transfer_updated.as_ref(),
-                                            &sessions,
                                             &running,
+                                            &last_activity,
+                                            &active_transfers,
                                         );
                                         if let Err(e) = result {
                                             log(
@@ -146,37 +261,86 @@ impl TftpServer {
                                                 &format!("TFTP transfer error: {e}"),
                                             );
                                         }
-                                    });
+                                    })
+                                {
+                                    session_threads
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .push(th);
+                                }
                             }
                         }
-                        Err(_) => {
+                        Err(e) => {
                             if !running.load(Ordering::SeqCst) {
                                 break;
                             }
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::WouldBlock
+                                    | ErrorKind::TimedOut
+                                    | ErrorKind::Interrupted
+                                    | ErrorKind::ConnectionReset
+                            ) {
+                                continue;
+                            }
+                            log(
+                                LogLevel::Debug,
+                                &format!("TFTP 监听异常（{e}），尝试重新绑定 {bind_addr}"),
+                            );
+                            *listener.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            std::thread::sleep(Duration::from_millis(300));
                         }
                     }
                 }
             })
             .map_err(|e| format!("启动 TFTP 线程失败: {e}"))?;
-        *self.thread.lock().unwrap() = Some(handle);
+        *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         Ok(())
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        if let Some(s) = self.listener.lock().unwrap().take() {
+        if let Some(s) = self
+            .listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             drop(s);
         }
-        // 会话线程在下次收包超时（最多 default_timeout 秒）后自行退出
-        if let Some(h) = self.thread.lock().unwrap().take() {
+        if let Some(h) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = h.join();
+        }
+        // 所有会话线程都在 250ms 轮询窗口内感知 running=false 并退出，逐一 join 确保彻底收尾
+        let handles: Vec<JoinHandle<()>> = std::mem::take(
+            &mut *self
+                .session_threads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for h in handles {
             let _ = h.join();
         }
     }
 }
 
+fn bind_tftp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(addr)?;
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(250)));
+    crate::disable_udp_connreset(&socket);
+    Ok(socket)
+}
+
+struct ActiveTransferGuard(Arc<AtomicUsize>);
+impl Drop for ActiveTransferGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_transfer(
-    root: &Path,
+    target: &TftpTarget,
     bind: Ipv4Addr,
     default_timeout: u32,
     max_retries: u32,
@@ -185,10 +349,10 @@ fn handle_transfer(
     pkt: &[u8],
     log: &LogFn,
     transfer_updated: Option<&TransferFn>,
-    sessions: &Mutex<Vec<Arc<UdpSocket>>>,
     running: &Arc<AtomicBool>,
+    last_activity: &Arc<AtomicU64>,
+    active_transfers: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    // 解析 filename / mode / options
     let mut pos = 2usize;
     let file_name = read_cstring(pkt, &mut pos);
     let mode = read_cstring(pkt, &mut pos);
@@ -202,12 +366,8 @@ fn handle_transfer(
         options.push((name, value));
     }
 
-    let safe = safe_name(&file_name);
-    let path = root.join(&safe);
-
     if op == 2 {
-        // 刷机只需 RRQ（路由器下载固件）。WRQ 允许任意 LAN 主机覆盖程序目录文件，
-        // 会破坏固件/租约/日志，一律拒绝（Access violation）。
+        // 只读下发：WRQ 一律拒绝（code 2 Access violation）
         let tmp = UdpSocket::bind(SocketAddr::new(bind.into(), 0))
             .map_err(|e| format!("绑定临时 socket 失败: {e}"))?;
         send_error(&tmp, client, 2, "Access violation: write requests disabled");
@@ -218,8 +378,8 @@ fn handle_transfer(
         return Ok(());
     }
 
-    if op == 1 && !path.is_file() {
-        // 用临时 socket 发错误
+    let resolved = resolve_rrq_path(target, &file_name, log);
+    let Some((path, display_name)) = resolved else {
         let tmp = UdpSocket::bind(SocketAddr::new(bind.into(), 0))
             .map_err(|e| format!("绑定临时 socket 失败: {e}"))?;
         send_error(&tmp, client, 1, "File not found");
@@ -228,27 +388,28 @@ fn handle_transfer(
             &format!("Read request for file <{file_name}>. Mode {mode} -> not found"),
         );
         return Ok(());
-    }
-
-    let session = Arc::new(
-        UdpSocket::bind(SocketAddr::new(bind.into(), 0))
-            .map_err(|e| format!("绑定会话 socket 失败: {e}"))?,
-    );
-    let local_port = session.local_addr().map_err(|e| e.to_string())?.port();
-    sessions.lock().unwrap().push(session.clone());
-
-    let total_bytes = if op == 1 {
-        std::fs::metadata(&path)
-            .map(|m| m.len() as i64)
-            .unwrap_or(-1)
-    } else {
-        -1
     };
+
+    let session = UdpSocket::bind(SocketAddr::new(bind.into(), 0))
+        .map_err(|e| format!("绑定会话 socket 失败: {e}"))?;
+    crate::disable_udp_connreset(&session);
+    // 固定 250ms 读超时，用于高频检查 running 标志与真实截止时间
+    session
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|e| e.to_string())?;
+    let local_port = session.local_addr().map_err(|e| e.to_string())?.port();
+
+    active_transfers.fetch_add(1, Ordering::SeqCst);
+    let _guard = ActiveTransferGuard(active_transfers.clone());
+
+    let total_bytes = std::fs::metadata(&path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(-1);
     let mut info = TransferInfo {
-        file_name: file_name.clone(),
+        file_name: display_name,
         remote: client.to_string(),
         total_bytes,
-        is_upload: op == 2,
+        is_upload: false,
         ..Default::default()
     };
 
@@ -263,49 +424,39 @@ fn handle_transfer(
         );
         log(
             LogLevel::Info,
-            &format!(
-                "{} request for file <{file_name}>. Mode {mode}",
-                if op == 1 { "Read" } else { "Write" }
-            ),
+            &format!("Read request for file <{file_name}>. Mode {mode}"),
         );
         log(LogLevel::Debug, &format!("Using local port {local_port}"));
 
+        // RFC 2347：OACK 中只能包含客户端实际请求且服务器支持的选项
         let mut blksize = 512usize;
         let mut timeout = default_timeout;
-        if let Some(bs) = options
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("blksize"))
-            .and_then(|(_, v)| v.parse::<usize>().ok())
-        {
-            blksize = bs.clamp(8, 65464);
-        }
-        if let Some(to) = options
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("timeout"))
-            .and_then(|(_, v)| v.parse::<u32>().ok())
-        {
-            timeout = to.clamp(1, 255);
-        }
-        session
-            .set_read_timeout(Some(Duration::from_secs(timeout as u64)))
-            .map_err(|e| e.to_string())?;
-
-        let want_oack = !options.is_empty();
-        let oack_pkt = if want_oack {
-            let mut oack: Vec<(String, String)> = vec![
-                ("blksize".into(), blksize.to_string()),
-                ("timeout".into(), timeout.to_string()),
-            ];
-            if op == 1 {
-                oack.push(("tsize".into(), info.total_bytes.max(0).to_string()));
+        let mut oack_opts: Vec<(String, String)> = Vec::new();
+        for (k, v) in &options {
+            if k.eq_ignore_ascii_case("blksize") {
+                if let Ok(bs) = v.parse::<usize>() {
+                    blksize = bs.clamp(8, 65464);
+                    oack_opts.push(("blksize".into(), blksize.to_string()));
+                }
+            } else if k.eq_ignore_ascii_case("timeout") {
+                if let Ok(to) = v.parse::<u32>() {
+                    timeout = to.clamp(1, 255);
+                    oack_opts.push(("timeout".into(), timeout.to_string()));
+                }
+            } else if k.eq_ignore_ascii_case("tsize") {
+                oack_opts.push(("tsize".into(), info.total_bytes.max(0).to_string()));
             }
-            let pkt = build_oack(&oack);
+        }
+
+        let oack_pkt = if !oack_opts.is_empty() {
+            let pkt = build_oack(&oack_opts);
             session.send_to(&pkt, client).map_err(|e| e.to_string())?;
             log(
                 LogLevel::Debug,
                 &format!(
                     "OACK: <{}>",
-                    oack.iter()
+                    oack_opts
+                        .iter()
                         .map(|(k, v)| format!("{k}={v}"))
                         .collect::<Vec<_>>()
                         .join(",")
@@ -316,32 +467,20 @@ fn handle_transfer(
             None
         };
 
-        if op == 1 {
-            rrq(
-                &session,
-                client,
-                &path,
-                blksize,
-                &mut info,
-                oack_pkt.as_deref(),
-                max_retries,
-                log,
-                transfer_updated,
-            )
-        } else {
-            wrq(
-                &session,
-                client,
-                &path,
-                blksize,
-                &mut info,
-                want_oack,
-                max_retries,
-                log,
-                transfer_updated,
-                running,
-            )
-        }
+        rrq(
+            &session,
+            client,
+            &path,
+            blksize,
+            Duration::from_secs(timeout as u64),
+            &mut info,
+            oack_pkt.as_deref(),
+            max_retries,
+            log,
+            transfer_updated,
+            running,
+            last_activity,
+        )
     })();
 
     if let Err(e) = &result {
@@ -351,26 +490,78 @@ fn handle_transfer(
             cb(info.clone());
         }
     }
-    sessions
-        .lock()
-        .unwrap()
-        .retain(|s| !Arc::ptr_eq(s, &session));
     result
 }
 
-// --------------------------------------------------------------------------- RRQ / WRQ
+/// 根据托管模式解析 RRQ 请求对应的本地文件路径。
+fn resolve_rrq_path(
+    target: &TftpTarget,
+    requested: &str,
+    log: &LogFn,
+) -> Option<(PathBuf, String)> {
+    match target {
+        TftpTarget::SingleFile {
+            path,
+            allow_fallback,
+        } => {
+            if !path.is_file() {
+                return None;
+            }
+            let actual_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "firmware.bin".into());
+            let normalized = requested.replace('\\', "/");
+            let req_base = normalized
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .trim_start_matches('/');
+            if req_base.eq_ignore_ascii_case(&actual_name) {
+                return Some((path.clone(), actual_name));
+            }
+            if *allow_fallback {
+                log(
+                    LogLevel::Info,
+                    &format!("路由器请求 <{requested}>，已自动映射至所选刷机包 <{actual_name}>"),
+                );
+                return Some((path.clone(), actual_name));
+            }
+            None
+        }
+        TftpTarget::Directory(root) => {
+            let safe = safe_name(requested)?;
+            let candidate = root.join(&safe);
+            if !candidate.is_file() {
+                return None;
+            }
+            // 双重校验 canonicalize 仍在 root 内（防符号链接或 Windows 特殊路径逃逸）
+            let canon_root = std::fs::canonicalize(root).ok()?;
+            let canon_file = std::fs::canonicalize(&candidate).ok()?;
+            if !canon_file.starts_with(&canon_root) {
+                return None;
+            }
+            Some((canon_file, safe))
+        }
+    }
+}
+
+// --------------------------------------------------------------------------- RRQ
 
 #[allow(clippy::too_many_arguments)]
 fn rrq(
     ts: &UdpSocket,
     client: SocketAddr,
-    path: &PathBuf,
+    path: &Path,
     blksize: usize,
+    ack_timeout: Duration,
     info: &mut TransferInfo,
     oack_pkt: Option<&[u8]>,
     max_retries: u32,
     log: &LogFn,
     transfer_updated: Option<&TransferFn>,
+    running: &Arc<AtomicBool>,
+    last_activity: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     let mut file = File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
     let mut data = vec![0u8; blksize];
@@ -379,39 +570,109 @@ fn rrq(
     let mut bytes: u64 = 0;
     let mut retr: u64 = 0;
     let sw = Instant::now();
+    let mut last_progress = Instant::now() - Duration::from_secs(1);
 
-    // OACK 之后客户端先 ACK 块 0（超时重发 OACK）
-    if let Some(oack) = oack_pkt
-        && !wait_ack(ts, 0, &mut retr, max_retries, &mut buf, &|| {
-            let _ = ts.send_to(oack, client);
-        })
-    {
-        info.error = Some("timeout waiting for initial ACK".into());
-        finish(info, sw, bytes, 0, retr, transfer_updated);
-        return Ok(());
+    // OACK 之后客户端需先 ACK 块 0（超时重发 OACK）
+    if let Some(oack) = oack_pkt {
+        match wait_ack(
+            ts,
+            client,
+            0,
+            ack_timeout,
+            &mut retr,
+            max_retries,
+            &mut buf,
+            running,
+            last_activity,
+            &|| {
+                let _ = ts.send_to(oack, client);
+            },
+        ) {
+            AckResult::Acked => {}
+            AckResult::Stopped => {
+                info.error = Some("server stopped".into());
+                finish(info, sw, bytes, 0, retr, transfer_updated);
+                return Ok(());
+            }
+            AckResult::ClientError(msg) => {
+                info.error = Some(format!("client error: {msg}"));
+                finish(info, sw, bytes, 0, retr, transfer_updated);
+                return Ok(());
+            }
+            AckResult::Timeout => {
+                info.error = Some("timeout waiting for initial ACK".into());
+                finish(info, sw, bytes, 0, retr, transfer_updated);
+                return Ok(());
+            }
+        }
     }
 
     let mut last = false;
     while !last {
-        let n = file.read(&mut data).map_err(|e| e.to_string())?;
-        send_data(ts, client, block, &data, n).map_err(|e| e.to_string())?;
-        info.blocks = block as u64;
-        let acked = wait_ack(ts, block, &mut retr, max_retries, &mut buf, &|| {
-            let _ = send_data(ts, client, block, &data, n);
-        });
-        if !acked {
-            info.error = Some("timeout".into());
-            finish(info, sw, bytes, block, retr, transfer_updated);
+        if !running.load(Ordering::SeqCst) {
+            info.error = Some("server stopped".into());
+            finish(
+                info,
+                sw,
+                bytes,
+                block.saturating_sub(1),
+                retr,
+                transfer_updated,
+            );
             return Ok(());
         }
+        // 循环读满整个块或直到真实 EOF，杜绝单次 short read 静默截断固件
+        let n = read_full_block(&mut file, &mut data).map_err(|e| format!("读取固件失败: {e}"))?;
+        send_data(ts, client, block, &data, n).map_err(|e| e.to_string())?;
+        info.blocks = block as u64;
+
+        match wait_ack(
+            ts,
+            client,
+            block,
+            ack_timeout,
+            &mut retr,
+            max_retries,
+            &mut buf,
+            running,
+            last_activity,
+            &|| {
+                let _ = send_data(ts, client, block, &data, n);
+            },
+        ) {
+            AckResult::Acked => {}
+            AckResult::Stopped => {
+                info.error = Some("server stopped".into());
+                finish(info, sw, bytes, block, retr, transfer_updated);
+                return Ok(());
+            }
+            AckResult::ClientError(msg) => {
+                info.error = Some(format!("client error: {msg}"));
+                finish(info, sw, bytes, block, retr, transfer_updated);
+                return Ok(());
+            }
+            AckResult::Timeout => {
+                info.error = Some("timeout".into());
+                finish(info, sw, bytes, block, retr, transfer_updated);
+                return Ok(());
+            }
+        }
+
         bytes += n as u64;
         info.bytes_sent = bytes;
+        info.retransmits = retr;
         if n < blksize {
             last = true;
         }
         block += 1;
-        fire_progress(info, sw, transfer_updated);
+
+        // 节流进度回调（每 100ms 一次），避免 30MB 固件触发 6 万次锁与堆分配
+        if last_progress.elapsed() >= Duration::from_millis(100) {
+            last_progress = Instant::now();
+            fire_progress(info, sw, transfer_updated);
+        }
     }
+
     finish(
         info,
         sw,
@@ -434,107 +695,105 @@ fn rrq(
     Ok(())
 }
 
+/// 从文件循环读取，直到填满 `buf` 或真正到达 EOF（遇 `Interrupted` 自动重试）。
+pub(crate) fn read_full_block(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+enum AckResult {
+    Acked,
+    Timeout,
+    Stopped,
+    ClientError(String),
+}
+
+/// 等待指定块号的 ACK（按真实超时截止时间重传，不因重复 ACK 立即重发，校验对端 TID）。
 #[allow(clippy::too_many_arguments)]
-fn wrq(
+fn wait_ack(
     ts: &UdpSocket,
     client: SocketAddr,
-    path: &PathBuf,
-    blksize: usize,
-    info: &mut TransferInfo,
-    oack_sent: bool,
+    expected: u32,
+    ack_timeout: Duration,
+    retr: &mut u64,
     max_retries: u32,
-    log: &LogFn,
-    transfer_updated: Option<&TransferFn>,
+    buf: &mut [u8],
     running: &Arc<AtomicBool>,
-) -> Result<(), String> {
-    let mut file = File::create(path).map_err(|e| format!("创建文件失败: {e}"))?;
-    let mut buf = [0u8; 65572];
-    let mut expected: u32 = 1;
-    let mut last_acked: u16 = 0;
-    let mut bytes: u64 = 0;
-    let mut retr: u64 = 0;
-    let sw = Instant::now();
+    last_activity: &Arc<AtomicU64>,
+    on_resend: &dyn Fn(),
+) -> AckResult {
+    let exp16 = (expected & 0xFFFF) as u16;
+    let mut retries: u32 = 0;
+    let mut deadline = Instant::now() + ack_timeout;
 
-    if !oack_sent {
-        send_ack(ts, client, 0).map_err(|e| e.to_string())?;
-        last_acked = 0;
-    }
-
-    let mut timeouts: u32 = 0;
     loop {
         if !running.load(Ordering::SeqCst) {
-            info.error = Some("server stopped".into());
-            break;
+            return AckResult::Stopped;
         }
-        match ts.recv(&mut buf) {
-            Err(_) => {
-                retr += 1;
-                timeouts += 1;
-                if timeouts > max_retries {
-                    info.error = Some("timeout".into());
-                    break;
-                }
-                let _ = send_ack(ts, client, last_acked);
+        if Instant::now() >= deadline {
+            retries += 1;
+            if retries > max_retries {
+                return AckResult::Timeout;
             }
-            Ok(n) => {
-                timeouts = 0;
+            *retr += 1;
+            on_resend();
+            deadline = Instant::now() + ack_timeout;
+        }
+
+        match ts.recv_from(buf) {
+            Ok((n, from)) => {
+                if from != client {
+                    // RFC 1350 §4: 未知传输 ID，回 ERROR 5 并继续等待原客户端
+                    send_error(ts, from, 5, "Unknown transfer ID");
+                    continue;
+                }
                 if n < 4 {
-                    continue; // 包太短：读 op 前的防下溢保护（n-4 会下溢/越界）
+                    continue;
                 }
                 let op = ((buf[0] as u16) << 8) | buf[1] as u16;
-                if op == 3 {
-                    // DATA
+                if op == 4 {
                     let blk = ((buf[2] as u16) << 8) | buf[3] as u16;
-                    // 块号按 u16 回绕比较（RFC 1350）
-                    let exp16 = (expected & 0xFFFF) as u16;
                     if blk == exp16 {
-                        let payload = n - 4;
-                        file.write_all(&buf[4..4 + payload])
-                            .map_err(|e| e.to_string())?;
-                        bytes += payload as u64;
-                        info.bytes_sent = bytes;
-                        info.blocks = expected as u64;
-                        send_ack(ts, client, blk).map_err(|e| e.to_string())?;
-                        last_acked = blk;
-                        if payload < blksize {
-                            break; // 最终块
-                        }
-                        expected += 1;
-                    } else if (blk as i16).wrapping_sub(exp16 as i16) < 0 {
-                        // 重复 DATA：重发最后一个 ACK
-                        let _ = send_ack(ts, client, last_acked);
+                        last_activity.store(now_unix(), Ordering::SeqCst);
+                        return AckResult::Acked;
                     }
-                    // blk > expected：乱序，忽略
+                    // RFC 1123 §4.2.3.1: 收到重复/滞后 ACK 不得立即重发 DATA（避免 Sorcerer's Apprentice）
                 } else if op == 5 {
-                    // ERROR
-                    info.error = Some("client aborted".into());
-                    break;
+                    let mut p = 4usize;
+                    let msg = read_cstring(&buf[..n], &mut p);
+                    return AckResult::ClientError(if msg.is_empty() {
+                        "aborted".into()
+                    } else {
+                        msg
+                    });
                 }
-                fire_progress(info, sw, transfer_updated);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock
+                        | ErrorKind::TimedOut
+                        | ErrorKind::Interrupted
+                        | ErrorKind::ConnectionReset
+                ) =>
+            {
+                // 继续循环检查 running 与 deadline
+            }
+            Err(_) => {
+                if !running.load(Ordering::SeqCst) {
+                    return AckResult::Stopped;
+                }
             }
         }
     }
-
-    info.done = true;
-    info.seconds = sw.elapsed().as_secs_f64();
-    info.retransmits = retr;
-    info.bytes_sent = bytes;
-    info.blocks = expected as u64;
-    if let Some(cb) = transfer_updated {
-        cb(info.clone());
-    }
-    log(
-        LogLevel::Info,
-        &format!(
-            "<{}>: received {} blks, {} bytes in {} s. {} blk resent",
-            info.file_name,
-            info.blocks,
-            bytes,
-            sw.elapsed().as_secs(),
-            retr
-        ),
-    );
-    Ok(())
 }
 
 // --------------------------------------------------------------------------- 包构造与工具
@@ -551,11 +810,6 @@ fn send_data(
     pkt[2] = (block >> 8) as u8;
     pkt[3] = block as u8;
     pkt[4..].copy_from_slice(&data[..len]);
-    ts.send_to(&pkt, client).map(|_| ())
-}
-
-fn send_ack(ts: &UdpSocket, client: SocketAddr, block: u16) -> std::io::Result<()> {
-    let pkt = [0u8, 4, (block >> 8) as u8, block as u8];
     ts.send_to(&pkt, client).map(|_| ())
 }
 
@@ -578,53 +832,6 @@ fn send_error(ts: &UdpSocket, client: SocketAddr, code: u16, message: &str) {
     let _ = ts.send_to(&pkt, client);
 }
 
-/// 等待 `expected` 块的 ACK；超时/重复时调用 `on_resend` 重发。
-fn wait_ack(
-    ts: &UdpSocket,
-    expected: u32,
-    retr: &mut u64,
-    max_retries: u32,
-    buf: &mut [u8],
-    on_resend: &dyn Fn(),
-) -> bool {
-    let mut timeouts: u32 = 0;
-    loop {
-        match ts.recv(buf) {
-            Err(_) => {
-                *retr += 1;
-                timeouts += 1;
-                if timeouts > max_retries {
-                    return false;
-                }
-                on_resend();
-            }
-            Ok(n) => {
-                timeouts = 0;
-                if n < 4 {
-                    continue;
-                }
-                let op = ((buf[0] as u16) << 8) | buf[1] as u16;
-                if op == 4 {
-                    let blk = ((buf[2] as u16) << 8) | buf[3] as u16;
-                    // 块号按 RFC 1350 用 u16 回绕比较（>65535 块后客户端 ACK 回绕为 0）
-                    let exp16 = (expected & 0xFFFF) as u16;
-                    if blk == exp16 {
-                        return true;
-                    }
-                    if (blk as i16).wrapping_sub(exp16 as i16) < 0 {
-                        // 前一块的重复 ACK：当前块可能丢失
-                        *retr += 1;
-                        on_resend();
-                    }
-                    // blk > expected：乱序，继续等
-                } else if op == 5 {
-                    return false; // 客户端错误
-                }
-            }
-        }
-    }
-}
-
 fn read_cstring(pkt: &[u8], pos: &mut usize) -> String {
     if *pos >= pkt.len() {
         return String::new();
@@ -635,19 +842,26 @@ fn read_cstring(pkt: &[u8], pos: &mut usize) -> String {
     }
     let s = String::from_utf8_lossy(&pkt[start..*pos]).into_owned();
     if *pos < pkt.len() {
-        *pos += 1; // 跳过分隔符
+        *pos += 1;
     }
     s
 }
 
-/// 只取 basename，防目录穿越。
-fn safe_name(file_name: &str) -> String {
-    file_name
-        .replace('\\', "/")
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
+/// 严格校验单段安全文件名（拒绝路径穿越、Windows 盘符相对路径如 `C:foo` 与非法字符）。
+fn safe_name(file_name: &str) -> Option<String> {
+    let trimmed = file_name.trim_start_matches(['/', '\\']);
+    // 含路径分隔符或非法字符一律拒绝（不再悄悄截取 basename 掩盖越权请求）
+    if !is_safe_filename(trimmed) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn finish(
@@ -672,5 +886,120 @@ fn fire_progress(info: &mut TransferInfo, sw: Instant, transfer_updated: Option<
     info.seconds = sw.elapsed().as_secs_f64();
     if let Some(cb) = transfer_updated {
         cb(info.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ShortReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl Read for ShortReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let rem = self.data.len() - self.pos;
+            if rem == 0 {
+                return Ok(0);
+            }
+            let n = rem.min(buf.len()).min(self.chunk);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_full_block_survives_short_reads() {
+        let src: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mut r = ShortReader {
+            data: &src,
+            pos: 0,
+            chunk: 73, // 模拟每次短读 73 字节
+        };
+        let mut block = [0u8; 512];
+        assert_eq!(read_full_block(&mut r, &mut block).unwrap(), 512);
+        assert_eq!(&block[..], &src[..512]);
+        assert_eq!(read_full_block(&mut r, &mut block).unwrap(), 512);
+        assert_eq!(&block[..], &src[512..1024]);
+        assert_eq!(read_full_block(&mut r, &mut block).unwrap(), 0);
+    }
+
+    #[test]
+    fn safe_name_rejects_traversal_and_drive_relative() {
+        assert_eq!(safe_name("fw.bin").as_deref(), Some("fw.bin"));
+        assert_eq!(safe_name("/fw.bin").as_deref(), Some("fw.bin"));
+        assert_eq!(safe_name(".."), None);
+        assert_eq!(safe_name("../secret.txt"), None);
+        assert_eq!(safe_name("C:secret.txt"), None);
+        assert_eq!(safe_name("sub\\fw.bin"), None);
+    }
+
+    #[test]
+    fn oack_only_echoes_requested_options() {
+        // 模拟小米路由器只请求 timeout=5（不请求 blksize/tsize）
+        let dir = std::env::temp_dir().join(format!("miwifi_tftp_oack_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let fw = dir.join("r4.bin");
+        std::fs::write(&fw, [0xABu8; 600]).unwrap();
+
+        let mut srv = TftpServer::single_file(fw.clone(), Ipv4Addr::LOCALHOST, true);
+        srv.set_port(0);
+        srv.start().unwrap();
+        let srv_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), srv.local_port().unwrap());
+
+        let cli = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cli.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        // 1. 单选项 timeout=5，且请求异名 "C0A81F65.img" -> 验证自动映射 + OACK 仅含 timeout=5
+        let mut rrq = vec![0u8, 1];
+        rrq.extend_from_slice(b"C0A81F65.img\x00octet\x00timeout\x005\x00");
+        cli.send_to(&rrq, srv_addr).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, from) = cli.recv_from(&mut buf).unwrap();
+        assert_eq!(((buf[0] as u16) << 8) | buf[1] as u16, 6); // OACK
+        let mut pos = 2;
+        let mut oack_opts = Vec::new();
+        while pos < n {
+            let k = read_cstring(&buf[..n], &mut pos);
+            if k.is_empty() {
+                break;
+            }
+            let v = read_cstring(&buf[..n], &mut pos);
+            oack_opts.push((k, v));
+        }
+        assert_eq!(oack_opts, vec![("timeout".to_string(), "5".to_string())]);
+
+        // ACK 0 并接收全部数据
+        cli.send_to(&[0, 4, 0, 0], from).unwrap();
+        let mut got = Vec::new();
+        for expected_blk in 1u16..=2 {
+            let (n, from) = cli.recv_from(&mut buf).unwrap();
+            assert_eq!(((buf[0] as u16) << 8) | buf[1] as u16, 3);
+            assert_eq!(((buf[2] as u16) << 8) | buf[3] as u16, expected_blk);
+            got.extend_from_slice(&buf[4..n]);
+            cli.send_to(&[0, 4, (expected_blk >> 8) as u8, expected_blk as u8], from)
+                .unwrap();
+        }
+        assert_eq!(got, vec![0xABu8; 600]);
+        assert!(srv.last_activity_unix() > 0);
+
+        // 2. 不带任何选项 -> 不应发 OACK，直接发 DATA block 1
+        let mut plain_rrq = vec![0u8, 1];
+        plain_rrq.extend_from_slice(b"r4.bin\0octet\0");
+        cli.send_to(&plain_rrq, srv_addr).unwrap();
+        let (n, from) = cli.recv_from(&mut buf).unwrap();
+        assert_eq!(((buf[0] as u16) << 8) | buf[1] as u16, 3); // 直接 DATA
+        assert_eq!(((buf[2] as u16) << 8) | buf[3] as u16, 1);
+        assert_eq!(n - 4, 512);
+        // 发 ERROR 结束该次测试会话
+        cli.send_to(&[0, 5, 0, 0, 0], from).unwrap();
+
+        srv.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

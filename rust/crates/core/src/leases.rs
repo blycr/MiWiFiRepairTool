@@ -31,9 +31,15 @@ pub fn load(path: &Path) -> LeaseFile {
 /// 保存租约到 JSON 文件（原子写：先写临时文件再改名）。
 pub fn save(path: &Path, file: &LeaseFile) -> Result<(), String> {
     let json = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_os);
     std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

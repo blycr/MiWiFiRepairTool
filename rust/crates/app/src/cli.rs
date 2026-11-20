@@ -2,16 +2,18 @@
 //! 命令行入口与共享状态。
 //!
 //! 模块划分（app crate）：
-//! - `cli`     本文件：`run()` 入口、共享状态 `CliState`、通用小工具
-//! - `menu`    主菜单（网卡/刷机包/云端下载/开始刷机）
-//! - `session` 刷机会话（DHCP/TFTP 绑定、提权设网卡、停止恢复）
-//! - `status`  刷机状态视图（渲染线程 + 操作/完成菜单）
-//! - `help`    使用说明（[4] 菜单）
-//! - `util`    Windows 平台工具（VT/提权/防火墙/控制台）
+//! - `cli`      本文件：`run()` 入口、残留网卡快照检测、共享状态 `CliState`、下载进度
+//! - `guardian` 单次 UAC 守护型提权 Helper（命名管道 + 断连/崩溃自动恢复 + 断电快照）
+//! - `menu`     主菜单（网卡/刷机包/云端下载/开始刷机）
+//! - `session`  刷机会话（端口预检 → 提权配网 → DHCP/TFTP 精确绑定 → 停止恢复）
+//! - `status`   刷机状态视图（渲染线程 + 操作/完成菜单）
+//! - `help`     使用说明（[4] 菜单）
+//! - `util`     Windows 平台工具（VT/单实例/控制台/参数转义/进度条）
 
 use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -20,10 +22,11 @@ use miwifi_repair_core::probe;
 use miwifi_repair_core::rom::{self, RomInfo};
 use miwifi_repair_core::tftp::TransferInfo;
 
+use crate::guardian;
 use crate::menu::main_menu;
 use crate::util::{self, progress_bar};
 
-/// 读取一行标准输入；EOF 或出错返回 None（调用方应视为退出/返回）。
+/// 读取一行标准输入；EOF 或被 Ctrl+C 中断返回 None。
 pub(crate) fn read_line_stdin() -> Option<String> {
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
@@ -107,14 +110,11 @@ impl CliState {
 /// CLI 主入口。
 pub fn run() {
     util::install_ctrl_c_handler();
-    // 启用 VT 序列（清屏/颜色）；失败（老 conhost/重定向）则降级为滚动输出，
-    // 避免把 ANSI 转义码当字面文本打印出来
     let vt = util::enable_vt();
     let tty = std::io::stdout().is_terminal() && vt;
 
     let logger = Logger::new();
     logger.set_ui_level(LogLevel::Info);
-    // tty 自刷新面板模式：日志已在面板显示，关闭 stderr 回显（防止与清屏重绘交错刷屏）
     logger.set_console_echo(!tty);
     if let Ok(dir) = util::exe_dir() {
         logger.set_file(dir.join("debug.log"));
@@ -135,22 +135,81 @@ pub fn run() {
     {
         let st = state.clone();
         logger.subscribe(move |_level, line| {
-            st.lock().unwrap().push_log(line.to_string());
+            st.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_log(line.to_string());
         });
     }
 
-    // ARP/ICMP 探测被安全软件拦截时，把警告接到 UI 日志并提示用户放行
     {
         let wlogger = logger.clone();
         probe::set_probe_warn_handler(Arc::new(move |msg| wlogger.warn(msg)));
     }
 
+    // 检查上次异常退出/整机断电遗留的网卡备份快照
+    check_pending_nic_backup(&logger);
+
     main_menu(&logger, &state, tty);
+}
+
+fn check_pending_nic_backup(logger: &Logger) {
+    let Some((path, backup)) = guardian::find_pending_backup() else {
+        return;
+    };
+    let mode_desc = if backup.nic.is_dhcp {
+        "DHCP 自动获取".to_string()
+    } else {
+        format!(
+            "静态 IP {}/{}",
+            backup
+                .nic
+                .ipv4
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "无".into()),
+            backup
+                .nic
+                .ipv4_mask
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "无".into())
+        )
+    };
+    println!();
+    println!(
+        "[检测到未恢复的网卡配置] 上次刷机可能因断电或异常中断，网卡「{}」原配置为：{}。",
+        backup.nic.name, mode_desc
+    );
+    print!("是否立即恢复该网卡原配置？[Y/n] > ");
+    std::io::stdout().flush().ok();
+    let Some(ans) = read_line_stdin() else {
+        return;
+    };
+    let trimmed = ans.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("y") {
+        match guardian::restore_from_backup_file(&path, &backup) {
+            Ok(warn) => {
+                logger.info(&format!("已从残留快照恢复网卡「{}」。", backup.nic.name));
+                println!("已恢复网卡「{}」。", backup.nic.name);
+                if let Some(w) = warn {
+                    logger.warn(&w);
+                    println!("[注意] {w}");
+                }
+            }
+            Err(e) => {
+                logger.error(&format!("恢复残留快照失败：{e}"));
+                println!("恢复失败：{e}（快照文件保留在 {}）", path.display());
+            }
+        }
+    } else {
+        println!(
+            "已跳过恢复（快照文件保留在 {}，如需丢弃可手动删除）。",
+            path.display()
+        );
+    }
 }
 
 // --------------------------------------------------------------------------- 下载进度
 
-/// 下载刷机包（终端下显示单行进度条，重定向时仅打日志）。
+/// 下载刷机包（支持 Ctrl+C 中断并安全清理 `.part`；终端单行进度条）。
 pub(crate) fn download_rom(
     rom: &RomInfo,
     logger: &Logger,
@@ -166,9 +225,9 @@ pub(crate) fn download_rom(
     let result = rom::download(
         rom,
         &dir,
-        Some(&|done| {
-            let frac = if rom.size > 0 {
-                done as f32 / rom.size as f32
+        Some(&|done, total| {
+            let frac = if total > 0 {
+                done as f32 / total as f32
             } else {
                 0.0
             };
@@ -185,22 +244,35 @@ pub(crate) fn download_rom(
                 );
                 std::io::stdout().flush().ok();
             } else {
-                let mut st = state.lock().unwrap();
+                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                 st.download_progress = frac;
                 st.download_text = rom.name.clone();
             }
         }),
+        Some(&util::CTRL_C),
     );
     if tty {
         println!();
     }
     match result {
-        Ok(path) => {
-            logger.info(&format!("下载完成：{}", path.display()));
-            Ok(path)
+        Ok(outcome) => {
+            if let Some(w) = &outcome.warning {
+                logger.warn(w);
+                println!("[注意] {w}");
+            }
+            logger.info(&format!(
+                "下载完成：{}（{} 字节）",
+                outcome.path.display(),
+                outcome.bytes
+            ));
+            Ok(outcome.path)
         }
         Err(e) => {
-            logger.warn(&format!("下载失败：{e}"));
+            if util::CTRL_C.load(Ordering::SeqCst) {
+                logger.info("下载已取消并清理临时文件。");
+            } else {
+                logger.warn(&format!("下载失败：{e}"));
+            }
             Err(e)
         }
     }

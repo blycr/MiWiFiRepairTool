@@ -1,6 +1,6 @@
 # 架构设计
 
-本文描述当前实现的架构：crate 划分、瞬时提权模型与 DHCP/TFTP 数据流。
+本文描述当前实现的架构：crate 划分、单次 UAC 守护提权模型与 DHCP/TFTP 数据流。
 命令行交互细节见 [cli-design.md](cli-design.md)。
 
 ## 总体结构
@@ -13,85 +13,95 @@ crates/app       命令行应用（唯一二进制入口）
 crates/selftest  无头自检入口
 ```
 
-`app` 内部按职责拆分模块（每个模块一个文件，均在 500 行以内）：
+`app` 内部按职责拆分模块：
 
 | 模块 | 职责 |
 | --- | --- |
-| `main` | 入口：参数解析（`--selftest` / `--elevated-op`）、单实例互斥、提权子进程模式 |
-| `cli` | `run()` 入口、共享状态 `CliState`、通用小工具（stdin/扫描/格式化） |
-| `menu` | 主菜单：网卡/刷机包选择、云端下载、开始刷机（静态交互，无渲染线程） |
-| `session` | 刷机会话：固件复制 → DHCP/TFTP 绑定 → 提权设网卡/防火墙 → 停止恢复 |
-| `status` | 刷机状态视图：渲染线程（终端清屏重绘 / 非终端周期摘要）、操作/完成菜单 |
-| `help` | 使用说明（`[4]` 菜单，含安全软件兼容与许可） |
-| `util` | Windows 平台工具：VT、瞬时提权、防火墙、控制台、进度条 |
+| `main` | 入口：参数解析（`--selftest` / `--guardian-pipe` / `--elevated-restore`）、单实例互斥 |
+| `cli` | `run()` 入口、启动残留 `nic_backup.json` 恢复检测、共享状态 `CliState`、下载进度 |
+| `guardian` | 单次 UAC 守护型提权 Helper（Win32 命名管道 + 断连/崩溃自动恢复 + 防火墙管理 + 断电快照） |
+| `layout` | 自适应终端左右分栏布局引擎（控制台窗口宽高探测、CJK 宽字符与 ANSI 感知裁切，绝不遮挡） |
+| `menu` | 主菜单：有线优先网卡列表、WLAN/链路预警、刷机包来源跟踪、云端下载、右侧精简操作对照 |
+| `session` | 刷机会话：端口预检 → 配静态 IP → 精确绑定 DHCP/TFTP → 实时接口/链路/正常态检测 → 幂等恢复 |
+| `status` | 刷机状态视图：左右分栏（左实时诊断与日志，右动态步骤对照与指示灯速查）+ 操作/完成菜单 |
+| `help` | 使用说明（`[4]` 菜单，含与原版一致的指示灯说明、安全软件兼容与许可） |
+| `util` | Windows 平台工具：VT、单实例、Ctrl+C、`CommandLineToArgvW` 参数转义、进度条 |
 
-## 瞬时提权模型（核心设计）
+## 单次 UAC 守护提权模型（核心设计）
 
-**问题**：改网卡（netsh static）与防火墙规则需要管理员权限；传统做法是整进程以
-管理员重启（弹新窗口、离开当前会话），或全程以管理员运行。
+**问题**：改网卡（`netsh`）与防火墙规则需要管理员权限。早期“瞬时提权子进程”在开始与停止时各弹
+一次 UAC，不仅体验打断，而且在 300s 自动停止、窗口被强关或进程崩溃时无法自动恢复网卡。
 
-**方案**：主进程（当前控制台会话）**全程驻留**跑菜单/DHCP/TFTP/监控；需要管理员的
-两件事通过**瞬时提权子进程**完成：
+**方案**：主进程（当前控制台会话）**全程驻留**跑菜单/DHCP/TFTP/监控；非管理员启动时采用
+**单次 UAC 守护型提权 Helper**（[guardian.rs](../rust/crates/app/src/guardian.rs)）：
 
-1. 主进程 `ShellExecuteExW`，`lpVerb="runas"` 弹 UAC；
-2. `SEE_MASK_NO_CONSOLE` + `SW_HIDE`：子进程**不创建新窗口**；
-3. 子进程执行 `--elevated-op set|restore`（netsh 设/恢复网卡 + 防火墙规则），
-   结果写 `%TEMP%\miwifi_elev_*.txt` 后退出；
-4. 主进程等待句柄（`SEE_MASK_NOCLOSEPROCESS`）并读结果文件，错误打印在当前窗口；
-5. 子进程全程**不 println**，包 `catch_unwind`，panic 也写进 result 文件；
-6. **set 失败自回滚**：子进程在操作前拍网卡快照，部分失败时按快照恢复；
-   restore 失败时主进程保留快照，下次 stop 可重试。
+1. 主进程创建独占随机名称的 Win32 命名管道 `\\.\pipe\MiWiFiRepairTool-<pid>-<rand>`
+   （`FILE_FLAG_FIRST_PIPE_INSTANCE`，max instances = 1）；
+2. `ShellExecuteExW`（`lpVerb="runas"` + `SEE_MASK_NO_CONSOLE` + `SW_HIDE`）静默启动提权子进程
+   `--guardian-pipe <pipe>`，**不弹出新控制台窗口**；
+3. 主进程经管道发送 JSON 指令 `set`：Helper 先落盘 `nic_backup.json`，再用 `Command::args`
+   精确调用 `netsh` 设置静态 IP **`192.168.31.100/24`**（不篡改 DNS），清理旧规则后添加 UDP 67/69
+   防火墙规则（防火墙服务被第三方安全软件关闭时仅记警告、不阻断刷机）；
+4. 刷机期间 Helper 零 CPU 阻塞在管道读端，可响应主进程的 `clear_arp`（以管理员权限清理陈旧
+   ARP 缓存）与 `restore` 指令；
+5. **自动兜底恢复**：正常停止时主进程发 `restore`；若主进程崩溃、被强杀或直接关闭终端窗口，
+   命名管道立即断开，Helper 自动按快照恢复网卡、删除防火墙规则并清理 `nic_backup.json`，
+   **全程无需第二次 UAC**；
+6. **整机断电恢复**：若遭遇断电，下次启动程序检测到残留 `nic_backup.json` 后主动提示一键恢复
+   （`--elevated-restore`）。
 
-关键时序：**先绑定 DHCP/TFTP（Windows 下绑定 67/69 无需管理员）→ 成功后再提权设网卡**。
-端口冲突在提权前即可失败，避免"提权 → 失败 → 再提权回滚"的连环 UAC。
+若主进程本身已以管理员身份运行，`NicGuard::Direct` 直接在进程内完成相同步骤（同样落盘
+`nic_backup.json` 并在 `Drop` 时自动恢复）。
 
 ## 会话数据流
 
 ```
-start_session(固件, 网卡)
-  ├─ 校验固件/链路（任何修改前）
-  ├─ 固件复制到程序目录（TFTP 根；失败清理半成品）
-  ├─ DHCP 绑定 0.0.0.0:67（配置池 192.168.31.100-199，载入历史租约）
-  ├─ TFTP 绑定 0.0.0.0:69（根=程序目录，只读，WRQ 拒绝）
-  ├─ 提权子进程 set：静态 192.168.31.1/24 + 防火墙 UDP 67,69 放行
+start_session(nic, fw)
+  ├─ 校验固件存在；无线网卡/链路无信号给出提示（不硬阻断）
+  ├─ 提权前预检 UDP 67/69 端口空闲（bind 后立即 drop；端口冲突零 UAC 失败）
+  ├─ NicGuard::activate：
+  │   ├─ 落盘 nic_backup.json（完整保留原 DHCP 标志 / IP / 掩码 / 默认网关 / DNS）
+  │   ├─ netsh 设置静态 192.168.31.100/24（不改动 DNS）
+  │   └─ 清理旧规则并添加 UDP 67,69 防火墙规则（失败降级为警告）
+  ├─ 若链路在线，轮询 wait_for_ip 最多 3 秒等待 192.168.31.100 生效
+  ├─ DHCP 精确绑定 192.168.31.100:67：
+  │   ├─ 地址池 192.168.31.101–200，网关/DNS 192.168.31.1，siaddr/ServerID 192.168.31.100
+  │   ├─ OFFER/ACK 写入 BOOTP file（偏移 108..236）与 Option 67（所选固件名）
+  │   ├─ 分配前 SendARP（指定源 IP 192.168.31.100）+ ICMP 探测；分配后经守卫清理 ARP 缓存
+  │   └─ 若网线暂未插好（Media Sense 导致 AddrNotAvailable），后台每 500ms 自动等待绑定
+  ├─ TFTP 精确绑定 192.168.31.100:69：
+  │   ├─ SingleFile 只读托管所选固件（支持异名自动映射，绝不暴露目录其他文件）
+  │   ├─ RFC 2347 严格 OACK（仅回传客户端请求的选项）
+  │   └─ RFC 1123 截止时间重传 + TID 校验 + read_full_block 防短读截断
   └─ running=true → 状态视图
 
 运行中
-  ├─ 渲染线程（每秒）：tick_connection（45s 告警 / 300s 自动停止）
-  │   + 终端清屏重绘 / 非终端 5s 摘要
-  └─ 主线程：Enter 操作/完成菜单（模态暂停重绘）、Ctrl+C 安全退出
+  ├─ 渲染线程：tick_connection（综合 DHCP + TFTP 活动；活跃传输与完成后不告警；45s 告警 / 300s 收尾）
+  │   + 终端清屏重绘 / 非终端 5s 摘要；协作退出（绝不调用 process::exit）
+  └─ 主线程：Enter 操作/完成菜单（模态暂停重绘）、Ctrl+C / EOF / 选 0 统一路径安全恢复
 
-stop(restore)
+stop(restore)（幂等）
   ├─ 导出 DHCP 租约 → leases.json（原子写）
-  ├─ TFTP/DHCP 停止 → 提权子进程 restore（按快照恢复网卡 + 删防火墙规则）
-  └─ running=false；会话代次 +1（丢弃旧线程迟到回调）
+  ├─ 停止并 join TFTP（250ms 内中止所有会话线程）与 DHCP 线程
+  ├─ NicGuard::restore（单次管道指令恢复原网卡 + 删防火墙规则 + 删 nic_backup.json，零二次 UAC）
+  └─ running=false；会话代次 +1
 ```
 
-## 共享状态与会话代次
+## 安全与可靠性要点
 
-`CliState`（`Arc<Mutex>`）跨菜单与状态视图共享：日志环形区、最近设备、TFTP 快照、
-下载进度、`running`、`transfer_epoch`。
-
-**会话代次**：每次 `start_session` 使 `transfer_epoch += 1`；TFTP 会话线程未 join 时
-其迟到回调携带旧代次，状态更新前比对代次、不符即丢弃——防止旧会话污染新会话状态
-（例如虚假"刷机完成"）。
-
-## 安全相关设计
-
-| 项 | 设计 |
+| 项 | 实现 |
 | --- | --- |
+| IP 规划 | PC `192.168.31.100/24`，池 `.101–.200`，网关 `.1`（对齐原版，避免与路由器冲突） |
+| 多网卡隔离 | DHCP/TFTP 精确绑定 `192.168.31.100`，防止广播发往 Wi-Fi 或向局域网其他设备派发 IP |
+| 网卡恢复保真 | `GetAdaptersAddresses` 传 `GAA_FLAG_INCLUDE_GATEWAYS` 完整保留网关；`Command::args` 传参 + Windows 控制台代码页解码 |
+| TFTP 隔离 | 仅托管所选单个 `.bin`；WRQ 一律返回 ERROR 2；目录模式亦校验 `is_safe_filename` 与 `canonicalize` |
+| ROM 下载原子性 | 写 `.part` + 校验 `Content-Length` + 支持 Ctrl+C 取消；失败先关闭句柄再删 `.part` |
+| ARP/ICMP 探测 | Win32 `IPAddr` 网络字节序（`from_ne_bytes`）；`ICMP_ECHO_REPLY` 偏移 4 读 `Status`；区分空闲与拦截错误码 |
 | 单实例 | `CreateMutexW`（Local 会话命名空间），守卫存活整个进程 |
-| 防火墙 | netsh 命令按 token 逐个传参（整串传参会静默失败），失败明确报错 |
-| TFTP 上传 | WRQ 一律拒绝（ERROR code 2），防止覆盖程序目录文件 |
-| DHCP 报文 | `hlen` 上界 16 防越界；活动时间仅在校验通过后刷新 |
-| TFTP 块号 | 按 u16 回绕比较（>65535 块不失败） |
-| 拦截提示 | SendARP/IcmpSendEcho/DeleteIpNetEntry 异常错误码 → 30s 节流警告；启动/配置失败附排查引导 |
 | 日志 | `debug.log` 恒记录全部级别；tty 面板模式关闭 stderr 回显避免与清屏交错 |
 
 ## 测试
 
-- **单元测试**（`cargo test -p miwifi-repair-core`）：token 拆分、URL 清洗/列表解析、
-  租约持久化往返等纯逻辑；
-- **集成自检**（`cargo run -p miwifi-repair-selftest`）：DHCP/TFTP 回环 + 云端在线检查，
-  期望 `SELFTEST: ALL PASS`；
-- **CI**（`.github/workflows/ci.yml`）：fmt / clippy（-D warnings）/ 单测 / 双架构 release 构建。
+- **单元测试**（`cargo test --workspace`）：覆盖 Win32 `IPAddr` 字节序与 ICMP 回环探测、网卡速率/GBK 解码/枚举、DHCP `bootfile`/NAK/INFORM 合规性、TFTP 单选项 OACK/短读/路径校验/单文件映射、ROM 清洗与路径安全、租约持久化、Windows 参数转义；
+- **集成自检**（`cargo run -p miwifi-repair-selftest`）：DHCP（含 bootfile/NAK/INFORM）+ TFTP（含单选项 OACK、512 倍数尾块、单文件异名映射、WRQ 拒绝、404）+ 云端在线检查，期望 `SELFTEST: ALL PASS`；
+- **CI**（`.github/workflows/ci.yml`）：推送 `v*` 标签时执行 fmt / clippy（`-D warnings`）/ 单测 / 双架构 release 构建与自检。
