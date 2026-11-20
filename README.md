@@ -65,8 +65,8 @@ Rust 实现，Windows 10/11，**x64 与 x86（32 位）双架构**，无第三�
 每个版本发布两个单文件 exe 及对应 SHA-256 校验文件：
 
 ```
-MiWiFiRepairTool-v<版本>-win-x64.exe      + -win-x64.sha256
-MiWiFiRepairTool-v<版本>-win-x86.exe      + -win-x86.sha256
+MiWiFiRepairTool-v<版本>-win-x64.exe      + -win-x64.exe.sha256
+MiWiFiRepairTool-v<版本>-win-x86.exe      + -win-x86.exe.sha256
 ```
 
 运行前校验哈希，例如：

@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "miwifi-repair-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "miwifi-repair-core",
  "serde",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "miwifi-repair-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "miwifi-repair-selftest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "miwifi-repair-core",
 ]
