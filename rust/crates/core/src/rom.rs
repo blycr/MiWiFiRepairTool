@@ -197,10 +197,8 @@ pub fn url_basename(url: &str) -> Option<String> {
         Some(idx) => &url[idx + 3..],
         None => url,
     };
-    let path = match after_scheme.find('/') {
-        Some(idx) => &after_scheme[idx + 1..],
-        None => return None,
-    };
+    let idx = after_scheme.find('/')?;
+    let path = &after_scheme[idx + 1..];
     let path = path.split(['?', '#']).next().unwrap_or("");
     if path.is_empty() {
         return None;
