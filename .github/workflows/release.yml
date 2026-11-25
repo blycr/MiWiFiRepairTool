@@ -1,22 +1,41 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的版本标签（例如 v0.3.0，需先推送 tag）'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
   release:
     name: Build & Publish Release (x64 + x86)
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
+      - name: Validate tag
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            Write-Error "Invalid tag format: $env:RELEASE_TAG (expected vX.Y.Z)"
+            exit 1
+          }
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -48,7 +67,7 @@ jobs:
       - name: Stage release assets & SHA256SUMS.txt
         shell: pwsh
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = $env:RELEASE_TAG
           $dist = "dist"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           $x64 = "MiWiFiRepairTool-$tag-win-x64.exe"
@@ -61,18 +80,12 @@ jobs:
           [System.IO.File]::WriteAllText("$PWD\$dist\SHA256SUMS.txt", $sums, [System.Text.UTF8Encoding]::new($false))
           Get-Content "$dist\SHA256SUMS.txt"
 
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-binaries
-          path: dist/*
-
       - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = $env:RELEASE_TAG
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag dist/* --clobber

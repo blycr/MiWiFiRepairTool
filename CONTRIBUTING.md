@@ -28,5 +28,5 @@ cargo build --release --target i686-pc-windows-msvc  # 编译 x86
 ## 发版流程（维护者）
 
 1. 更新根 `Cargo.toml` 的 `workspace.package.version`、`crates/app/app.manifest` 的版本号以及 `CHANGELOG.md`。
-2. 提交并推送 `main`，确认 `CI` 绿灯。
-3. 推送标签 `git tag -a v<版本> -m "v<版本>" && git push origin v<版本>`，GitHub Actions `Release` 工作流会自动编译 x64/x86、执行双架构自检、生成 `SHA256SUMS.txt` 并创建草稿/正式 Release。
+2. 在本地跑通 `fmt`、`clippy`、`test`、`selftest`，确认无误后提交推送 `main` 并打标签 `git tag -a v<版本> -m "v<版本>" && git push origin v<版本>`。
+3. 直接本地构建 x64/x86 上传 Release，或按需手动触发 GitHub Actions 的 `Release` 工作流（`gh workflow run release.yml -f tag=v<版本>`）自动构建并发布。日常推送默认不触发 Actions，以节省 runner 资源。
