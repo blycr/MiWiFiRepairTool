@@ -1,0 +1,31 @@
+name: Bug 反馈
+description: 反馈刷机失败、闪退、网卡恢复异常或界面显示问题
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: 工具版本与架构
+      placeholder: 例如 v0.2.0 / win-x64（请先确认使用的是最新版）
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 路由器型号与 Windows 版本
+      placeholder: 例如 小米路由器 4C / Windows 11 24H2
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 现象与复现步骤
+      description: 简述操作过程、路由器指示灯状态以及界面提示
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: debug.log 相关片段（如有）
+      description: 程序同目录下的 debug.log，尽量贴出关键日志方便定位
+      render: text

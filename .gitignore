@@ -1,38 +1,26 @@
-# Build output (C# legacy under archive/, Rust under rust/)
-bin/
-obj/
-out/
-publish/
-Release/
+# Rust build & local cache
+target/
+.cargo-home/
 *.pdb
 
-# IDE
+# Release staging
+Release/
+
+# Runtime logs & state
+*.log
+leases.json
+nic_backup.json
+
+# IDE & OS
 .vs/
 .vscode/
 *.user
-*.suo
-*.userprefs
-
-# Local dotnet CLI / NuGet caches
-.dotnet-cli/
-.nuget-cache/
-
-# OS
 Thumbs.db
 Desktop.ini
 .DS_Store
 
-# Logs
-*.log
-
-# Binary analysis scratch (decompilation artifacts)
+# Local-only reverse engineering scratch & archives (never committed)
 .ana/
-
-# Rust build output & local cargo cache (workspace-internal)
-rust/target/
-rust/.cargo-home/
-
-# Local-only sensitive docs & archives (NOT pushed to public GitHub)
 old/
 docs/ANALYSIS.md
 docs/DEVELOPER.md

@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & Publish Release (x64 + x86)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format & Clippy & Tests
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Build x64 & x86 release
+        run: |
+          cargo build --release
+          cargo build --release --target i686-pc-windows-msvc
+
+      - name: Verify dual-arch self-test
+        run: |
+          .\target\release\MiWiFiRepairTool.exe --version
+          .\target\release\MiWiFiRepairTool.exe --selftest
+          .\target\i686-pc-windows-msvc\release\MiWiFiRepairTool.exe --version
+          .\target\i686-pc-windows-msvc\release\MiWiFiRepairTool.exe --selftest
+
+      - name: Stage release assets & SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $x64 = "MiWiFiRepairTool-$tag-win-x64.exe"
+          $x86 = "MiWiFiRepairTool-$tag-win-x86.exe"
+          Copy-Item "target\release\MiWiFiRepairTool.exe" "$dist\$x64"
+          Copy-Item "target\i686-pc-windows-msvc\release\MiWiFiRepairTool.exe" "$dist\$x86"
+          $h64 = (Get-FileHash "$dist\$x64" -Algorithm SHA256).Hash.ToUpper()
+          $h86 = (Get-FileHash "$dist\$x86" -Algorithm SHA256).Hash.ToUpper()
+          $sums = "$h64  $x64`n$h86  $x86`n"
+          [System.IO.File]::WriteAllText("$PWD\$dist\SHA256SUMS.txt", $sums, [System.Text.UTF8Encoding]::new($false))
+          Get-Content "$dist\SHA256SUMS.txt"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: dist/*
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag dist/* --clobber
+          } else {
+            gh release create $tag dist/* --title "MiWiFiRepairTool $tag" --generate-notes --latest
+          }

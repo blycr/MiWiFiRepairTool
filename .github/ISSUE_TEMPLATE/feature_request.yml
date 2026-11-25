@@ -1,0 +1,11 @@
+name: 机型反馈 / 功能建议
+description: 反馈已验证成功的路由器型号，或提出功能与体验改进建议
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: detail
+    attributes:
+      label: 需求或适配反馈说明
+      description: 简述想解决什么问题，或分享哪款小米路由器已实测救砖成功
+    validations:
+      required: true

@@ -41,6 +41,24 @@ fn main() {
         std::process::exit(2);
     }
 
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("MiWiFiRepairTool {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "MiWiFiRepairTool {} - 小米路由器救砖工具（Windows 命令行版）\n\n\
+             用法:\n  \
+               MiWiFiRepairTool.exe              进入交互式菜单\n  \
+               MiWiFiRepairTool.exe --selftest   运行 DHCP/TFTP 回环与云端接口自检\n  \
+               MiWiFiRepairTool.exe --version    显示版本号\n  \
+               MiWiFiRepairTool.exe --help       显示本帮助信息",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+
     if args.iter().any(|a| a == "--selftest") {
         std::process::exit(miwifi_repair_core::selftest::run());
     }
